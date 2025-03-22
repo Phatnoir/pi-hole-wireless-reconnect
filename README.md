@@ -56,7 +56,7 @@ sudo chmod +x /usr/local/bin/router_reconnect.sh
 Create a new service file:
 
 ```bash
-sudo nano /etc/systemd/system/router-reconnect.service
+sudo nano /etc/systemd/system/router_reconnect.service
 ```
 
 Add the following content:
@@ -78,8 +78,8 @@ WantedBy=multi-user.target
 Enable and start the service:
 
 ```bash
-sudo systemctl enable router-reconnect.service
-sudo systemctl start router-reconnect.service
+sudo systemctl enable router_reconnect.service
+sudo systemctl start router_reconnect.service
 ```
 
 ## Configuration
