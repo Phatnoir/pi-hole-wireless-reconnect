@@ -2,6 +2,8 @@
 
 A robust Bash script that monitors network connectivity on a Pi-hole device, automatically reconnects when the connection drops, and sends SMS alerts for status updates.
 
+>This app has no affiliation with pi-hole
+
 ## Features
 
 * **Automatic reconnection** — Detects connectivity loss and reattempts connection
