@@ -1,4 +1,5 @@
 #!/bin/bash
+set -eE  # Exit on error, ensure ERR traps are inherited
 
 # Force UTF-8
 export LANG=en_US.UTF-8
@@ -32,51 +33,81 @@ HEARTBEAT_LOG="/var/log/router_heartbeat.log" # New: dedicated log for heartbeat
 INTERNET_FAILURES=0
 MAX_INTERNET_FAILURES=5
 
-# Check for mail command availability
-if ! command -v mail >/dev/null; then
-    echo "mail command not found — SMS notifications will not work"
-    echo "Please install mailutils or equivalent package"
-    exit 1
+# Lock file
+LOCK_FILE="/tmp/reconnect_router.lock"
+
+# Function to log messages (define early for diagnostic use)
+log_message() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "$timestamp - $1" >> "$LOG_FILE" 2>/dev/null || echo "$timestamp - $1" >> "/tmp/router_reconnect.log"
+    echo "$timestamp - $1"
+}
+
+# Check for required dependencies
+for cmd in mail iconv ip ping; do
+    if ! command -v $cmd >/dev/null; then
+        echo "ERROR: Required command '$cmd' not found. Please install the necessary package."
+        exit 1
+    fi
+done
+
+# Check /tmp permissions - more portable across Unix systems
+if [ "$(ls -ld /tmp | awk '{print $1}')" != "drwxrwxrwt" ]; then
+    log_message "WARNING: /tmp directory doesn't have correct permissions (1777/drwxrwxrwt). This may cause lock file issues."
+    # Uncomment to automatically fix permissions:
+    # sudo chmod 1777 /tmp
 fi
 
 # Create a lock file to prevent multiple instances
-LOCK_FILE="/tmp/reconnect_router.lock"
-exec 200>$LOCK_FILE
+exec 200>"$LOCK_FILE"
 
 if ! flock -n 200; then
     echo "Script is already running. Exiting."
     exit 1
 fi
 
-# Ensure log files and directories exist
+# Ensure log files and directories exist with fallback to /tmp
 for LOG in "$LOG_FILE" "$DOWNTIME_LOG" "$HEARTBEAT_LOG"; do
-    # Create directory if needed (without using flock yet since file might not exist)
+    # Create directory if needed
     if [ ! -d "$(dirname $LOG)" ]; then
-        sudo mkdir -p "$(dirname $LOG)"
+        if ! sudo mkdir -p "$(dirname $LOG)" 2>/dev/null; then
+            # If can't create in /var/log, fall back to /tmp
+            NEW_LOG="/tmp/$(basename $LOG)"
+            log_message "WARNING: Could not create directory for $LOG, falling back to $NEW_LOG"
+            
+            # Update variable based on name
+            if [ "$LOG" = "$LOG_FILE" ]; then
+                LOG_FILE="$NEW_LOG"
+            elif [ "$LOG" = "$DOWNTIME_LOG" ]; then
+                DOWNTIME_LOG="$NEW_LOG"
+            elif [ "$LOG" = "$HEARTBEAT_LOG" ]; then
+                HEARTBEAT_LOG="$NEW_LOG"
+            fi
+            LOG="$NEW_LOG"
+        fi
     fi
     
     # Touch the file if it doesn't exist
     if [ ! -f "$LOG" ]; then
-        sudo touch "$LOG"
-        sudo chown "$(whoami)" "$LOG"
+        if ! sudo touch "$LOG" 2>/dev/null || ! sudo chown "$(whoami)" "$LOG" 2>/dev/null; then
+            log_message "WARNING: Could not create or set permissions for $LOG"
+        else
+            # Set explicit permissions
+            sudo chmod 644 "$LOG" 2>/dev/null || true
+        fi
     fi
     
-    # Now we can safely flock on the existing file
-    flock "$LOG" -c "echo 'Log file ready: $LOG'" > /dev/null 2>&1
+    # Now make sure we can write to it
+    if ! touch "$LOG" 2>/dev/null; then
+        log_message "ERROR: Cannot write to log file $LOG. Check permissions."
+    fi
+    
+    # Add log rotation check
+    if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -ge 10485760 ]; then
+        log_message "Log file $LOG has grown too large, rotating"
+        sudo mv "$LOG" "$LOG.$(date '+%Y%m%d%H%M%S')" 2>/dev/null || true
+    fi
 done
-
-# Ensure heartbeat is initialized on startup
-if [ "$HEARTBEAT_ENABLED" = true ] && [ ! -f "$HEARTBEAT_FILE" ]; then
-    echo "$(date +%s)" > "$HEARTBEAT_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') | HEARTBEAT | INITIALIZED | Startup initialization" >> "$HEARTBEAT_LOG"
-fi
-
-# Function to log messages
-log_message() {
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "$timestamp - $1" >> "$LOG_FILE"
-    echo "$timestamp - $1"
-}
 
 # Function to log downtime events
 log_downtime() {
@@ -85,7 +116,8 @@ log_downtime() {
     local duration="$2"
     
     # Format: TIMESTAMP | EVENT | DURATION | ADDITIONAL_INFO
-    echo "$timestamp | $event | $duration | $3" >> "$DOWNTIME_LOG"
+    echo "$timestamp | $event | $duration | $3" >> "$DOWNTIME_LOG" 2>/dev/null || \
+        echo "$timestamp | $event | $duration | $3" >> "/tmp/router_downtime.log"
     
     # Also log to main log (can be commented out to reduce redundancy if desired)
     log_message "Downtime event: $event | $duration | $3"
@@ -96,9 +128,16 @@ log_heartbeat() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local event="$1"
     
-    # Format: TIMESTAMP | EVENT | STATUS | ADDITIONAL_INFO
-    echo "$timestamp | HEARTBEAT | $event | $2" >> "$HEARTBEAT_LOG"
+    # Format: TIMESTAMP | HEARTBEAT | EVENT | ADDITIONAL_INFO
+    echo "$timestamp | HEARTBEAT | $event | $2" >> "$HEARTBEAT_LOG" 2>/dev/null || \
+        echo "$timestamp | HEARTBEAT | $event | $2" >> "/tmp/router_heartbeat.log"
 }
+
+# Ensure heartbeat is initialized on startup
+if [ "$HEARTBEAT_ENABLED" = "true" ] && [ ! -f "$HEARTBEAT_FILE" ]; then
+    echo "$(date +%s)" > "$HEARTBEAT_FILE" 2>/dev/null || log_message "WARNING: Could not create heartbeat file"
+    log_heartbeat "INITIALIZED" "Startup initialization"
+fi
 
 # Enhanced SMS function with better message queuing and retry logic
 send_sms() {
@@ -206,7 +245,7 @@ send_email_with_retry() {
     local success=false
     
     while [ $attempts -lt $max_attempts ]; do
-        # Fix character encoding issues by converting to ASCII
+        # Fix character encoding issues by converting to ASCII - skip invalid chars
         echo -e "$message" | iconv -f UTF-8 -t ASCII//TRANSLIT | mail -s "$EMAIL_SUBJECT" -a "Content-Type: text/plain; charset=UTF-8" "$SMS_EMAIL" 2>/dev/null
         if [ $? -eq 0 ]; then
             success=true
@@ -224,7 +263,7 @@ send_email_with_retry() {
 
 # Function to manage heartbeat
 process_heartbeat() {
-    if [ "$HEARTBEAT_ENABLED" != true ]; then
+    if [ "$HEARTBEAT_ENABLED" != "true" ]; then
         return
     fi
     
@@ -301,45 +340,145 @@ check_connection() {
 # Function to restart network interface
 restart_interface() {
     log_message "Attempting to restart $INTERFACE..."
+    
+    # Check if interface exists
+    if ! ip link show "$INTERFACE" >/dev/null 2>&1; then
+        log_message "ERROR: Interface $INTERFACE does not exist"
+        return 1
+    fi
 
     # Kill any hanging DHCP client processes
-    sudo pkill dhclient
+    sudo pkill dhclient 2>/dev/null || true
     sleep 1
 
-    # Release DHCP lease with verbose output
-    sudo dhclient -v -r $INTERFACE 2>/dev/null
+    # Detect DHCP client type
+    DHCP_CLIENT=""
+    if command -v dhclient >/dev/null; then
+        DHCP_CLIENT="dhclient"
+    elif command -v dhcpcd >/dev/null; then
+        DHCP_CLIENT="dhcpcd"
+    else
+        log_message "WARNING: No DHCP client found."
+    fi
+
+    # Release DHCP lease based on client type
+    if [ "$DHCP_CLIENT" = "dhclient" ]; then
+        log_message "Releasing DHCP lease with dhclient"
+        sudo dhclient -v -r $INTERFACE 2>/dev/null || true
+    elif [ "$DHCP_CLIENT" = "dhcpcd" ]; then
+        log_message "Releasing DHCP lease with dhcpcd"
+        sudo dhcpcd -k $INTERFACE 2>/dev/null || true
+    fi
     sleep 2
 
     # Bring interface down
-    sudo ip link set $INTERFACE down
+    log_message "Bringing interface down"
+    sudo ip link set $INTERFACE down || {
+        log_message "ERROR: Failed to bring interface down"
+        return 1
+    }
     sleep 2
 
     # Clear IP address
-    sudo ip addr flush dev $INTERFACE
+    log_message "Flushing IP address"
+    if ip link show "$INTERFACE" | grep -q 'UP'; then
+        sudo ip addr flush dev $INTERFACE || {
+            log_message "ERROR: Failed to flush IP address"
+        }
+    else
+        log_message "Interface is down, skipping IP address flush"
+    fi
 
     # Bring interface up
-    sudo ip link set $INTERFACE up
+    log_message "Bringing interface up"
+    sudo ip link set $INTERFACE up || {
+        log_message "ERROR: Failed to bring interface up"
+        return 1
+    }
     sleep 5
 
-    # Release and renew DHCP lease more explicitly with verbose output
-    sudo dhclient -v -r $INTERFACE 2>/dev/null
-    sleep 2
-    sudo dhclient -v $INTERFACE
+    # Get new IP address based on client type
+    if [ "$DHCP_CLIENT" = "dhclient" ]; then
+        log_message "Requesting new IP with dhclient"
+        sudo dhclient -v $INTERFACE || {
+            log_message "ERROR: dhclient failed to get IP"
+        }
+    elif [ "$DHCP_CLIENT" = "dhcpcd" ]; then
+        log_message "Requesting new IP with dhcpcd"
+        sudo dhcpcd $INTERFACE || {
+            log_message "ERROR: dhcpcd failed to get IP"
+        }
+    else
+        log_message "No DHCP client available. Waiting for system to assign IP."
+        # Some systems will automatically assign an IP when the interface comes up
+        sleep 10
+    fi
 
     # Wait for interface to stabilize
     sleep 5
+    
+    # Verify we have an IP
+    if ! ip addr show dev "$INTERFACE" | grep -q 'inet '; then
+        log_message "WARNING: No IP address assigned to $INTERFACE after restart"
+        return 1
+    else
+        log_message "IP address successfully assigned to $INTERFACE"
+        return 0
+    fi
+}
+
+# Run self-test to check environment
+self_test() {
+    log_message "Running self-test..."
+    
+    # Test lock file creation
+    if ! touch "$LOCK_FILE" 2>/dev/null; then
+        log_message "ERROR: Cannot create lock file at $LOCK_FILE. Check /tmp permissions."
+        return 1
+    fi
+    
+    # Test network interface
+    if ! ip link show "$INTERFACE" >/dev/null 2>&1; then
+        log_message "WARNING: Network interface '$INTERFACE' not found. Script may not work correctly."
+        log_message "Available interfaces:"
+        ip link show | grep -E '^[0-9]+:' | cut -d' ' -f2 | tr -d ':' | while read -r iface; do
+            log_message " - $iface"
+        done
+    fi
+    
+    # Test DHCP client availability
+    if ! command -v dhclient >/dev/null && ! command -v dhcpcd >/dev/null; then
+        log_message "WARNING: No DHCP client (dhclient or dhcpcd) found. Network restart may fail."
+    fi
+    
+    # Test router reachability 
+    if ! ping -c 1 -W 2 "$ROUTER_IP" >/dev/null 2>&1; then
+        log_message "WARNING: Cannot reach router at $ROUTER_IP. Please verify router IP address."
+    fi
+    
+    log_message "Self-test complete."
+    return 0
 }
 
 # Trap script termination
 cleanup() {
     log_message "Script stopped. Ensuring interface is up..."
     log_heartbeat "STOPPED" "Script terminated"
-    sudo ip link set $INTERFACE up
-    # Release the lock file
-    flock -u 200
+    sudo ip link set $INTERFACE up 2>/dev/null || true
+    
+    # Clean up temp files
+    rm -f /tmp/sms_queue.txt || true
+    
+    # Release and close the lock file
+    flock -u 200 || true
+    exec 200>&- || true
+    
     exit 0
 }
 trap cleanup SIGTERM SIGINT SIGHUP EXIT
+
+# Run self-test
+self_test || log_message "WARNING: Self-test reported issues, but continuing execution"
 
 # Main loop
 connection_was_down=false
@@ -354,6 +493,8 @@ while true; do
     # Process heartbeat if needed
     current_time=$(date +%s)
     if [ $((current_time - last_heartbeat_check)) -ge 60 ]; then  # Check every minute
+        # Process heartbeat first, then update the check time
+        # This prevents missed heartbeats from being reset too early
         process_heartbeat
         last_heartbeat_check=$current_time
     fi
@@ -395,7 +536,7 @@ while true; do
                     up_time=$(date '+%Y-%m-%d %H:%M:%S')
                     
                     # Calculate downtime
-                    down_time_seconds=$(date -d "$down_time" +%s)
+                    down_time_seconds=$(date -u -d "$down_time" +%s)
                     up_time_seconds=$(date -d "$up_time" +%s)
                     downtime_seconds=$((up_time_seconds - down_time_seconds))
                     downtime_minutes=$((downtime_seconds / 60))

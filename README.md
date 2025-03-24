@@ -14,6 +14,10 @@ A robust Bash script that monitors network connectivity on a Pi-hole device, aut
 * **Message prioritization** — Reduces notification spam by prioritizing important messages
 * **System integration** — Runs automatically at startup via systemd
 * **Robust locking** — Prevents multiple instances from running simultaneously
+* **Self-test** — Verifies environment and dependencies on startup
+* **Error handling** — Set up with trap handlers for safe termination
+* **Fallback logging** — Redirects to /tmp if standard log locations are unavailable
+* **Log rotation** — Automatically rotates large log files to prevent disk space issues
 
 ## Prerequisites
 
@@ -110,6 +114,9 @@ Before using the script, you need to modify several variables in the script:
    - `HEARTBEAT_ENABLED`: Enable/disable heartbeat monitoring (default: true)
    - `HEARTBEAT_INTERVAL`: Time between heartbeat checks (default: 3600s = 1 hour)
    - `MISSED_HEARTBEATS_THRESHOLD`: Number of missed heartbeats before alerting (default: 3)
+   - `PING_COUNT`: Number of pings to send when checking connection (default: 2)
+   - `PING_TIMEOUT`: Timeout in seconds for ping operation (default: 3)
+   - `MAX_INTERNET_FAILURES`: Number of internet failures before temporary backoff (default: 5)
 
 4. Save and close the file
 
@@ -140,7 +147,30 @@ The script uses multiple log files for different types of events:
 - **Downtime log** (`/var/log/router_downtime.log`): Connection loss and recovery events
 - **Heartbeat log** (`/var/log/router_heartbeat.log`): Heartbeat status and interruptions
 
-You can monitor these logs separately for more targeted troubleshooting.
+You can monitor these logs separately for more targeted troubleshooting. If the script cannot write to the standard locations, it will automatically fall back to using files in the `/tmp` directory.
+
+### Log Management
+
+The script includes two complementary approaches to log management:
+
+#### 1. Built-in Basic Log Rotation
+
+The script performs basic size-based log rotation:
+
+```bash
+# Add log rotation check
+if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -ge 10485760 ]; then
+    log_message "Log file $LOG has grown too large, rotating"
+    sudo mv "$LOG" "$LOG.$(date '+%Y%m%d%H%M%S')" 2>/dev/null || true
+fi
+```
+
+This provides an emergency safeguard against excessive log growth but has limitations:
+- It doesn't compress rotated logs
+- It doesn't remove old rotated logs
+- The 10MB threshold may be too large for comfortable viewing
+
+> **Note:** For most users, we recommend implementing the system-level log rotation described below, which provides more complete log management.
 
 ### Exponential Backoff
 
@@ -196,7 +226,7 @@ The script will run automatically at system startup. You can manually control it
 
 ```bash
 # Start the service
-sudo systemctl enable reconnect_router.service
+sudo systemctl enable router_reconnect.service
 sudo systemctl start router_reconnect.service
 
 # Stop the service
@@ -224,31 +254,41 @@ tail -f /var/log/router_downtime.log
 tail -f /var/log/router_heartbeat.log
 ```
 
-### Log Rotation
+### Recommended System-Level Log Rotation
 
-To prevent log files from growing too large, set up log rotation:
+For the most effective log management, set up system-level log rotation using logrotate:
 
 ```bash
 sudo nano /etc/logrotate.d/router_reconnect
 ```
 
-Add the following content:
+Add the following improved configuration:
 
 ```
 /var/log/router_reconnect.log /var/log/router_downtime.log /var/log/router_heartbeat.log {
     rotate 4
     weekly
     compress
+    size 2M
     missingok
     notifempty
     create 0644 root root
+    delaycompress
 }
 ```
 
-This configuration will:
-- Rotate logs on a weekly basis instead of daily
-- Keep 4 rotations (approximately one month of logs)
+This enhanced configuration will:
+- Rotate logs when they reach 2MB in size (much more manageable than 10MB)
+- Perform rotation weekly or when size threshold is reached, whichever comes first
+- Keep 4 rotations of history (approximately one month of logs)
 - Compress old log files to save space
+- Ensure proper permissions on new log files
+- Delay compression by one cycle to avoid issues with open file handles
+
+To apply the configuration immediately:
+```bash
+sudo logrotate -f /etc/logrotate.d/router_reconnect
+```
 
 ## SMS Alert Types
 
@@ -261,12 +301,24 @@ The script sends different types of alerts:
 - **[CRITICAL]** - All reconnection attempts failed
 - **[HEARTBEAT]** - No longer sent (heartbeat only used for downtime detection)
 
+## Self-Test Feature
+
+The script now includes a self-test function that runs at startup to check for potential issues:
+
+- Verifies lock file creation
+- Confirms network interface exists and lists available interfaces if not found
+- Checks for DHCP client availability
+- Tests router reachability
+
+This helps identify configuration problems before they cause runtime failures.
+
 ## Troubleshooting
 
 ### Script not starting
 - Check if the service is running: `sudo systemctl status router_reconnect.service`
 - Verify script permissions: `sudo chmod +x /usr/local/bin/router_reconnect.sh`
 - Check for error messages: `sudo journalctl -u router_reconnect.service`
+- Look for information in the self-test output in the main log
 
 ### SMS notifications not working
 - Verify the mail command is installed: `which mail`
@@ -284,10 +336,17 @@ The script sends different types of alerts:
 - Verify the router IP is correct: `ping 192.168.1.1` (replace with your router's IP)
 - Check the DHCP client is working: `ps aux | grep dhclient`
 - Review verbose dhclient output in the logs
+- Verify both dhclient and dhcpcd availability on your system
 
 ### Heartbeat not working
 - Check if the heartbeat file exists: `ls -l /tmp/pihole_last_heartbeat`
 - Verify heartbeat log has entries: `cat /var/log/router_heartbeat.log`
+- Check file permissions on the heartbeat file
+
+### Lock file issues
+- Check /tmp directory permissions: `ls -ld /tmp`
+- Verify lock file exists: `ls -l /tmp/reconnect_router.lock`
+- Make sure no stale lock files remain after script termination
 
 ## License
 
@@ -308,6 +367,8 @@ echo "Removing script..."
 sudo rm -f /usr/local/bin/router_reconnect.sh
 echo "Removing logs..."
 sudo rm -f /var/log/router_reconnect.log /var/log/router_downtime.log /var/log/router_heartbeat.log
+echo "Removing temporary files..."
+sudo rm -f /tmp/reconnect_router.lock /tmp/sms_queue.txt /tmp/pihole_last_heartbeat
 echo "Reloading systemd..."
 sudo systemctl daemon-reload
 echo "Uninstallation complete."
