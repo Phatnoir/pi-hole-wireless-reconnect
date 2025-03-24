@@ -51,10 +51,10 @@ During installation:
 
 ```bash
 # Copy the script to /usr/local/bin/
-sudo cp router_reconnect.sh /usr/local/bin/
+sudo cp reconnect_router.sh /usr/local/bin/
 
 # Make it executable
-sudo chmod +x /usr/local/bin/router_reconnect.sh
+sudo chmod +x /usr/local/bin/reconnect_router.sh
 ```
 
 ### 4. Create a Systemd Service
@@ -62,7 +62,7 @@ sudo chmod +x /usr/local/bin/router_reconnect.sh
 Create a new service file:
 
 ```bash
-sudo nano /etc/systemd/system/router_reconnect.service
+sudo nano /etc/systemd/system/reconnect_router.service
 ```
 
 Add the following content:
@@ -73,7 +73,7 @@ Description=Pi-hole Wireless Reconnect Script
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/router_reconnect.sh
+ExecStart=/usr/local/bin/reconnect_router.sh
 Restart=always
 User=root
 
@@ -84,8 +84,8 @@ WantedBy=multi-user.target
 Enable and start the service:
 
 ```bash
-sudo systemctl enable router_reconnect.service
-sudo systemctl start router_reconnect.service
+sudo systemctl enable reconnect_router.service
+sudo systemctl start reconnect_router.service
 ```
 
 ## Configuration
@@ -94,7 +94,7 @@ Before using the script, you need to modify several variables in the script:
 
 1. Edit the script with your preferred editor:
    ```bash
-   sudo nano /usr/local/bin/router_reconnect.sh
+   sudo nano /usr/local/bin/reconnect_router.sh
    ```
 
 2. Update the following variables:
@@ -143,7 +143,7 @@ MISSED_HEARTBEATS_THRESHOLD=3  # Alert after this many missed heartbeats
 
 The script uses multiple log files for different types of events:
 
-- **Main log** (`/var/log/router_reconnect.log`): General script activity
+- **Main log** (`/var/log/reconnect_router.log`): General script activity
 - **Downtime log** (`/var/log/router_downtime.log`): Connection loss and recovery events
 - **Heartbeat log** (`/var/log/router_heartbeat.log`): Heartbeat status and interruptions
 
@@ -226,17 +226,17 @@ The script will run automatically at system startup. You can manually control it
 
 ```bash
 # Start the service
-sudo systemctl enable router_reconnect.service
-sudo systemctl start router_reconnect.service
+sudo systemctl enable reconnect_router.service
+sudo systemctl start reconnect_router.service
 
 # Stop the service
-sudo systemctl stop router_reconnect.service
+sudo systemctl stop reconnect_router.service
 
 # Restart the service
-sudo systemctl restart router_reconnect.service
+sudo systemctl restart reconnect_router.service
 
 # Check status
-sudo systemctl status router_reconnect.service
+sudo systemctl status reconnect_router.service
 ```
 
 ## Monitoring and Logs
@@ -245,7 +245,7 @@ Check the various logs to see the script's activity:
 
 ```bash
 # View the main log
-tail -f /var/log/router_reconnect.log
+tail -f /var/log/reconnect_router.log
 
 # View downtime events
 tail -f /var/log/router_downtime.log
@@ -259,13 +259,13 @@ tail -f /var/log/router_heartbeat.log
 For the most effective log management, set up system-level log rotation using logrotate:
 
 ```bash
-sudo nano /etc/logrotate.d/router_reconnect
+sudo nano /etc/logrotate.d/reconnect_router
 ```
 
 Add the following improved configuration:
 
 ```
-/var/log/router_reconnect.log /var/log/router_downtime.log /var/log/router_heartbeat.log {
+/var/log/reconnect_router.log /var/log/router_downtime.log /var/log/router_heartbeat.log {
     rotate 4
     weekly
     compress
@@ -287,7 +287,7 @@ This enhanced configuration will:
 
 To apply the configuration immediately:
 ```bash
-sudo logrotate -f /etc/logrotate.d/router_reconnect
+sudo logrotate -f /etc/logrotate.d/reconnect_router
 ```
 
 ## SMS Alert Types
@@ -315,9 +315,9 @@ This helps identify configuration problems before they cause runtime failures.
 ## Troubleshooting
 
 ### Script not starting
-- Check if the service is running: `sudo systemctl status router_reconnect.service`
-- Verify script permissions: `sudo chmod +x /usr/local/bin/router_reconnect.sh`
-- Check for error messages: `sudo journalctl -u router_reconnect.service`
+- Check if the service is running: `sudo systemctl status reconnect_router.service`
+- Verify script permissions: `sudo chmod +x /usr/local/bin/reconnect_router.sh`
+- Check for error messages: `sudo journalctl -u reconnect_router.service`
 - Look for information in the self-test output in the main log
 
 ### SMS notifications not working
@@ -359,14 +359,14 @@ If you need to completely remove the script and its components from your system,
 ```bash
 #!/bin/bash
 echo "Stopping and disabling router-reconnect service..."
-sudo systemctl stop router_reconnect.service
-sudo systemctl disable router_reconnect.service
+sudo systemctl stop reconnect_router.service
+sudo systemctl disable reconnect_router.service
 echo "Removing service file..."
-sudo rm -f /etc/systemd/system/router_reconnect.service
+sudo rm -f /etc/systemd/system/reconnect_router.service
 echo "Removing script..."
-sudo rm -f /usr/local/bin/router_reconnect.sh
+sudo rm -f /usr/local/bin/reconnect_router.sh
 echo "Removing logs..."
-sudo rm -f /var/log/router_reconnect.log /var/log/router_downtime.log /var/log/router_heartbeat.log
+sudo rm -f /var/log/reconnect_router.log /var/log/router_downtime.log /var/log/router_heartbeat.log
 echo "Removing temporary files..."
 sudo rm -f /tmp/reconnect_router.lock /tmp/sms_queue.txt /tmp/pihole_last_heartbeat
 echo "Reloading systemd..."
@@ -374,7 +374,7 @@ sudo systemctl daemon-reload
 echo "Uninstallation complete."
 ```
 
-Save this as `uninstall_router_reconnect.sh`, make it executable with `chmod +x uninstall_router_reconnect.sh`, and run it with `sudo ./uninstall_router_reconnect.sh`.
+Save this as `uninstall_reconnect_router.sh`, make it executable with `chmod +x uninstall_reconnect_router.sh`, and run it with `sudo ./uninstall_reconnect_router.sh`.
 
 ## Contributing
 
