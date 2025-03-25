@@ -1,5 +1,5 @@
 #!/bin/bash
-set -eE  # Exit on error, ensure ERR traps are inherited
+set -eEu  # Exit on error, ensure ERR traps are inherited, error on unset variables
 
 # Force UTF-8
 export LANG=en_US.UTF-8
@@ -8,7 +8,7 @@ export LC_ALL=en_US.UTF-8
 # Configuration
 ROUTER_IP="192.168.1.1" # Default value - should match user's router config
 INTERFACE="wlan0"
-LOG_FILE="/var/log/router_reconnect.log"
+LOG_FILE="/var/log/reconnect_router.log"
 DOWNTIME_LOG="/var/log/router_downtime.log" # New: dedicated log for tracking downtime events
 MAX_RETRIES=10
 RETRY_DELAY=15
@@ -39,9 +39,36 @@ LOCK_FILE="/tmp/reconnect_router.lock"
 # Function to log messages (define early for diagnostic use)
 log_message() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "$timestamp - $1" >> "$LOG_FILE" 2>/dev/null || echo "$timestamp - $1" >> "/tmp/router_reconnect.log"
+    echo "$timestamp - $1" >> "$LOG_FILE" 2>/dev/null || echo "$timestamp - $1" >> "/tmp/reconnect_router.log"
     echo "$timestamp - $1"
 }
+
+# Advanced diagnostic logging
+log_message "Script started with PID $$"
+log_message "Command line: $0 $@"
+log_message "Last terminated reason: $(journalctl -u reconnect_router.service -n 20 | grep -i 'terminated' | tail -1 2>/dev/null || echo 'Not available')"
+
+# Check for startup frequency - NEW
+STARTUP_CHECK_FILE="/tmp/reconnect_router_last_start"
+STARTUP_THRESHOLD=300  # 5 minutes
+
+if [ -f "$STARTUP_CHECK_FILE" ]; then
+    last_start=$(cat "$STARTUP_CHECK_FILE" 2>/dev/null || echo "0")
+    current_time=$(date +%s)
+    elapsed=$((current_time - last_start))
+    
+    if [ $elapsed -lt $STARTUP_THRESHOLD ]; then
+        log_message "Script restarted within $elapsed seconds - suppressing start notification"
+        SUPPRESS_START_NOTIFICATION=true
+    else
+        SUPPRESS_START_NOTIFICATION=false
+    fi
+else
+    SUPPRESS_START_NOTIFICATION=false
+fi
+
+# Update startup time
+echo $(date +%s) > "$STARTUP_CHECK_FILE"
 
 # Check for required dependencies
 for cmd in mail iconv ip ping; do
@@ -58,6 +85,16 @@ if [ "$(ls -ld /tmp | awk '{print $1}')" != "drwxrwxrwt" ]; then
     # sudo chmod 1777 /tmp
 fi
 
+# Enhanced lock file handling - NEW
+# Check if the process holding the lock is still running
+if [ -f "$LOCK_FILE" ]; then
+    PID=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+    if [ -n "$PID" ] && ! ps -p "$PID" > /dev/null 2>&1; then
+        log_message "Removing stale lock file from PID $PID"
+        rm -f "$LOCK_FILE"
+    fi
+fi
+
 # Create a lock file to prevent multiple instances
 exec 200>"$LOCK_FILE"
 
@@ -65,6 +102,9 @@ if ! flock -n 200; then
     echo "Script is already running. Exiting."
     exit 1
 fi
+
+# Create lock file with PID - NEW
+echo $$ > "$LOCK_FILE"
 
 # Ensure log files and directories exist with fallback to /tmp
 for LOG in "$LOG_FILE" "$DOWNTIME_LOG" "$HEARTBEAT_LOG"; do
@@ -245,8 +285,9 @@ send_email_with_retry() {
     local success=false
     
     while [ $attempts -lt $max_attempts ]; do
-        # Fix character encoding issues by converting to ASCII - skip invalid chars
-        echo -e "$message" | iconv -f UTF-8 -t ASCII//TRANSLIT | mail -s "$EMAIL_SUBJECT" -a "Content-Type: text/plain; charset=UTF-8" "$SMS_EMAIL" 2>/dev/null
+        # Fix character encoding issues by converting to ASCII - with better error handling
+        converted=$(echo -e "$message" | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || echo "$message")
+        echo "$converted" | mail -s "$EMAIL_SUBJECT" -a "Content-Type: text/plain; charset=UTF-8" "$SMS_EMAIL" 2>/dev/null
         if [ $? -eq 0 ]; then
             success=true
             break
@@ -282,9 +323,9 @@ process_heartbeat() {
     local elapsed_time=$((current_time - last_heartbeat))
     
     # Check if we should update the heartbeat
-    if [ $elapsed_time -ge $HEARTBEAT_INTERVAL ]; then
+    if [ "$elapsed_time" -ge "$HEARTBEAT_INTERVAL" ]; then
         # Check if we missed too many heartbeats
-        if [ $elapsed_time -ge $((HEARTBEAT_INTERVAL * MISSED_HEARTBEATS_THRESHOLD)) ]; then
+        if [ "$elapsed_time" -ge "$((HEARTBEAT_INTERVAL * MISSED_HEARTBEATS_THRESHOLD))" ]; then
             # We missed several heartbeats - might have been down
             local down_time=$(date -d "@$last_heartbeat" '+%Y-%m-%d %H:%M:%S')
             local current_time_str=$(date '+%Y-%m-%d %H:%M:%S')
@@ -324,7 +365,7 @@ check_connection() {
         log_message "Can reach router but cannot reach internet (1.1.1.1)"
         ((INTERNET_FAILURES++))
         
-        if [ $INTERNET_FAILURES -ge $MAX_INTERNET_FAILURES ]; then
+        if [ "$INTERNET_FAILURES" -ge "$MAX_INTERNET_FAILURES" ]; then
             log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — stopping retries temporarily"
             sleep $((RETRY_DELAY * 5)) # Back off more aggressively for internet issues
             INTERNET_FAILURES=0
@@ -460,7 +501,7 @@ self_test() {
     return 0
 }
 
-# Trap script termination
+# Trap script termination - ENHANCED CLEANUP
 cleanup() {
     log_message "Script stopped. Ensuring interface is up..."
     log_heartbeat "STOPPED" "Script terminated"
@@ -469,7 +510,8 @@ cleanup() {
     # Clean up temp files
     rm -f /tmp/sms_queue.txt || true
     
-    # Release and close the lock file
+    # Release and remove the lock file
+    rm -f "$LOCK_FILE" || true
     flock -u 200 || true
     exec 200>&- || true
     
@@ -487,12 +529,19 @@ last_heartbeat_check=$(date +%s)
 
 log_message "Network monitoring started for interface $INTERFACE"
 log_heartbeat "STARTED" "Monitoring initialization"
-send_sms "[START] Pi-hole network monitoring started on $HOSTNAME"
+
+# Only send startup SMS if not suppressed due to recent restart - NEW
+if [ "$SUPPRESS_START_NOTIFICATION" != "true" ]; then
+    send_sms "[START] Pi-hole network monitoring started on $HOSTNAME"
+    log_message "Sent startup notification"
+else
+    log_message "Startup notification suppressed due to recent restart"
+fi
 
 while true; do
     # Process heartbeat if needed
     current_time=$(date +%s)
-    if [ $((current_time - last_heartbeat_check)) -ge 60 ]; then  # Check every minute
+    if [ "$((current_time - last_heartbeat_check))" -ge 60 ]; then  # Check every minute
         # Process heartbeat first, then update the check time
         # This prevents missed heartbeats from being reset too early
         process_heartbeat
@@ -503,12 +552,12 @@ while true; do
         ((consecutive_failures++))
         
         # Cap consecutive_failures to avoid unbounded backoff
-        if [ $consecutive_failures -gt 10 ]; then
+        if [ "$consecutive_failures" -gt 10 ]; then
             consecutive_failures=10
         fi
 
         # Only trigger reconnection after 2 consecutive failures
-        if [ $consecutive_failures -ge 2 ]; then
+        if [ "$consecutive_failures" -ge 2 ]; then
             if [ "$connection_was_down" = false ]; then
                 down_time=$(date '+%Y-%m-%d %H:%M:%S')
                 log_message "Network connectivity lost at $down_time"
@@ -543,11 +592,8 @@ while true; do
                     downtime_seconds=$((downtime_seconds % 60))
                     downtime_str="${downtime_minutes}m ${downtime_seconds}s"
                     
-                    recovery_message="[OK] Pi-hole Back Online!
-Down: $down_time
-Up: $up_time
-Downtime: $downtime_str
-Attempts needed: $i of $MAX_RETRIES"
+                    # Shorter message format to fit within SMS 160 character limit
+                    recovery_message="[OK] Pi-hole Online! Down: ${downtime_minutes}m${downtime_seconds}s. ${i}/${MAX_RETRIES} attempts"
                     
                     # Use only log_downtime to prevent duplicate logging
                     log_downtime "CONNECTION_RESTORED" "$downtime_str" "$i attempts needed"
@@ -597,12 +643,12 @@ Manual intervention required!"
     fi
 
     # Calculate delay using exponential backoff with a ceiling
-    if [ $consecutive_failures -gt 5 ]; then
+    if [ "$consecutive_failures" -gt 5 ]; then
         # Calculate backoff delay (2^n)
         backoff=$((RETRY_DELAY * (2 ** (consecutive_failures - 5))))
         
         # Cap the backoff at 10 minutes (600 seconds)
-        if [ $backoff -gt 600 ]; then
+        if [ "$backoff" -gt 600 ]; then
             backoff=600
         fi
         

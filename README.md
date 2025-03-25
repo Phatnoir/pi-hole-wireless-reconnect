@@ -13,11 +13,14 @@ A robust Bash script that monitors network connectivity on a Pi-hole device, aut
 * **Multiple log files** — Separate logs for reconnection events, downtime tracking, and heartbeats
 * **Message prioritization** — Reduces notification spam by prioritizing important messages
 * **System integration** — Runs automatically at startup via systemd
-* **Robust locking** — Prevents multiple instances from running simultaneously
+* **Robust locking** — Prevents multiple instances from running simultaneously with stale lock detection
 * **Self-test** — Verifies environment and dependencies on startup
 * **Error handling** — Set up with trap handlers for safe termination
 * **Fallback logging** — Redirects to /tmp if standard log locations are unavailable
 * **Log rotation** — Automatically rotates large log files to prevent disk space issues
+* **Anti-spam measures** — Suppresses duplicate startup notifications when service restarts frequently
+* **Concise SMS format** — Optimized messages fit within SMS character limits
+* **Enhanced reliability** — Properly quoted variables and better error handling throughout
 
 ## Prerequisites
 
@@ -74,12 +77,15 @@ After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/reconnect_router.sh
-Restart=always
+Restart=on-failure
+RestartSec=30
 User=root
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+> **Note:** The service now uses `Restart=on-failure` instead of `Restart=always` and includes a `RestartSec=30` directive to prevent excessive restart cycles.
 
 Enable and start the service:
 
@@ -117,10 +123,23 @@ Before using the script, you need to modify several variables in the script:
    - `PING_COUNT`: Number of pings to send when checking connection (default: 2)
    - `PING_TIMEOUT`: Timeout in seconds for ping operation (default: 3)
    - `MAX_INTERNET_FAILURES`: Number of internet failures before temporary backoff (default: 5)
+   - `STARTUP_THRESHOLD`: Time (in seconds) to suppress duplicate startup notifications (default: 300)
 
 4. Save and close the file
 
 ## Advanced Configuration
+
+### Startup Notification Management
+
+The script now includes a feature to prevent duplicate startup notifications when the service restarts frequently:
+
+```bash
+# Startup notification configuration
+STARTUP_CHECK_FILE="/tmp/reconnect_router_last_start"
+STARTUP_THRESHOLD=300  # 5 minutes
+```
+
+If the script restarts within 5 minutes of a previous run, it will suppress the startup SMS notification to reduce message spam. You can adjust the threshold by changing the value (in seconds).
 
 ### Heartbeat Monitoring
 
@@ -137,6 +156,27 @@ To configure heartbeat monitoring:
 HEARTBEAT_ENABLED=true         # Set to false to disable heartbeat
 HEARTBEAT_INTERVAL=3600        # Time between heartbeats in seconds (1 hour)
 MISSED_HEARTBEATS_THRESHOLD=3  # Alert after this many missed heartbeats
+```
+
+### Enhanced Lock File Handling
+
+The script now includes improved lock file management:
+- Detects and removes stale lock files from crashed script instances
+- Stores PID in the lock file for better tracking
+- Properly releases locks during script termination
+
+This prevents issues where a crashed script might leave behind a lock file that blocks future script runs.
+
+### SMS Notifications
+
+Notification format has been optimized to fit within SMS character limits (160 characters):
+- Connection restored messages are now more concise
+- Critical information is preserved while removing verbose details
+- Recovery messages show downtime duration and attempts used
+
+Example recovery message:
+```
+[OK] Pi-hole Online! Down: 2m30s. 3/10 attempts
 ```
 
 ### Log Files
@@ -294,16 +334,28 @@ sudo logrotate -f /etc/logrotate.d/reconnect_router
 
 The script sends different types of alerts:
 
-- **[START]** - Script has started
+- **[START]** - Script has started (suppressed if restarted within 5 minutes)
 - **[ALERT]** - Network connection lost
 - **[TRYING]** - Reconnection attempts (limited to reduce spam)
-- **[OK]** - Connection successfully restored
+- **[OK]** - Connection successfully restored (with concise downtime info)
 - **[CRITICAL]** - All reconnection attempts failed
 - **[HEARTBEAT]** - No longer sent (heartbeat only used for downtime detection)
 
+## Advanced Diagnostics
+
+The script now includes enhanced diagnostic logging to help troubleshoot service issues:
+
+```bash
+log_message "Script started with PID $$"
+log_message "Command line: $0 $@"
+log_message "Last terminated reason: $(journalctl -u reconnect_router.service -n 20 | grep -i 'terminated' | tail -1)"
+```
+
+This provides valuable information in the logs about how the script is being initialized and why previous instances terminated.
+
 ## Self-Test Feature
 
-The script now includes a self-test function that runs at startup to check for potential issues:
+The script includes a self-test function that runs at startup to check for potential issues:
 
 - Verifies lock file creation
 - Confirms network interface exists and lists available interfaces if not found
@@ -320,6 +372,11 @@ This helps identify configuration problems before they cause runtime failures.
 - Check for error messages: `sudo journalctl -u reconnect_router.service`
 - Look for information in the self-test output in the main log
 
+### Multiple start notifications
+- If you're receiving multiple [START] notifications, check if your systemd service is set to `Restart=always` instead of `Restart=on-failure`
+- Verify the `STARTUP_THRESHOLD` value (default 300 seconds) is appropriate for your environment
+- Check logs for signs of script crashes causing frequent restarts
+
 ### SMS notifications not working
 - Verify the mail command is installed: `which mail`
 - Check if iconv is available: `which iconv`
@@ -330,6 +387,10 @@ This helps identify configuration problems before they cause runtime failures.
   Replace the gateway domain with your carrier's SMS gateway as needed.
 - Check mail logs: `tail -f /var/log/mail.log`
 - Verify carrier gateway settings for your provider
+
+### SMS messages getting truncated
+- The script now uses a more concise format for notifications to avoid truncation
+- If messages are still getting truncated, you may need to further customize the recovery message format
 
 ### Network not reconnecting properly
 - Confirm the correct network interface name with: `ip a`
@@ -346,7 +407,7 @@ This helps identify configuration problems before they cause runtime failures.
 ### Lock file issues
 - Check /tmp directory permissions: `ls -ld /tmp`
 - Verify lock file exists: `ls -l /tmp/reconnect_router.lock`
-- Make sure no stale lock files remain after script termination
+- If you suspect a stale lock file, check if the PID it contains is still running: `cat /tmp/reconnect_router.lock && ps -p $(cat /tmp/reconnect_router.lock)`
 
 ## License
 
@@ -368,7 +429,7 @@ sudo rm -f /usr/local/bin/reconnect_router.sh
 echo "Removing logs..."
 sudo rm -f /var/log/reconnect_router.log /var/log/router_downtime.log /var/log/router_heartbeat.log
 echo "Removing temporary files..."
-sudo rm -f /tmp/reconnect_router.lock /tmp/sms_queue.txt /tmp/pihole_last_heartbeat
+sudo rm -f /tmp/reconnect_router.lock /tmp/sms_queue.txt /tmp/pihole_last_heartbeat /tmp/reconnect_router_last_start
 echo "Reloading systemd..."
 sudo systemctl daemon-reload
 echo "Uninstallation complete."
