@@ -314,7 +314,6 @@ process_heartbeat() {
     if [ ! -f "$HEARTBEAT_FILE" ]; then
         echo "$current_time" > "$HEARTBEAT_FILE"
         log_heartbeat "INITIALIZED" "First run"
-        # Removed initial heartbeat SMS - we'll only send alerts, not status messages
         return
     fi
     
@@ -337,14 +336,11 @@ process_heartbeat() {
             log_heartbeat "MISSED" "$downtime_str (${elapsed_time}s)"
             log_downtime "SCRIPT_INTERRUPTED" "$downtime_str" "Detected via missed heartbeats"
             
-            send_sms "[ALERT] Pi-hole monitoring resumed after inactivity
-Last seen: $down_time
-Current: $current_time_str
-Downtime: ${hours}h ${minutes}m ${seconds}s"
+            # FIXED SMS FORMAT - More concise to fit within 160 characters
+            send_sms "[ALERT] Pi-hole back online! Down: ${hours}h${minutes}m${seconds}s (${down_time} to now)"
         else
             # Normal heartbeat - log but don't send SMS
             log_heartbeat "NORMAL" "${elapsed_time}s since last heartbeat"
-            # Removed SMS notification for normal heartbeats
         fi
         
         # Update heartbeat time
