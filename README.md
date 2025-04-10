@@ -110,7 +110,7 @@ User=root
 WantedBy=multi-user.target
 ```
 
-> **Note:** The service uses `Restart=on-failure` with `RestartSec=30` to prevent excessive restart cycles.
+> **Note:** The service uses `Restart=always` with `RestartSec=30` to prevent excessive restart cycles.
 
 Enable and start the service:
 
