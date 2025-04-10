@@ -102,7 +102,7 @@ After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/reconnect_router.sh
-Restart=on-failure
+Restart=always
 RestartSec=30
 User=root
 
