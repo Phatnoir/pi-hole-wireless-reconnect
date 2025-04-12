@@ -4,14 +4,36 @@ A robust Bash script that monitors network connectivity on a Pi-hole device, aut
 
 >This script is an independent project and is not associated with or supported by the Pi-hole team.
 
+## Table of Contents
+- [Quick Start](#quick-start)
+- [Features](#features)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Configuration](#configuration)
+  - [Basic Configuration](#basic-configuration)
+  - [Advanced Configuration](#advanced-configuration)
+- [Usage](#usage)
+- [Monitoring and Logs](#monitoring-and-logs)
+- [Troubleshooting](#troubleshooting)
+- [Uninstallation](#uninstallation)
+- [License](#license)
+- [Contributing](#contributing)
+
 ## Quick Start
+
+<details>
+<summary><strong>Click to expand Quick Start</strong></summary>
 
 ```bash
 # 1. Install dependencies
 sudo apt update && sudo apt install -y postfix mailutils libc-bin
 
+# 👉 If using Gmail as your mail relay, you'll also need to:
+#    - Create an App Password: https://myaccount.google.com/apppasswords
+#    - Configure Postfix with your Gmail SMTP credentials (see "Advanced Mail Configuration" below)
+
 # 2. Get the script
-wget -O reconnect_router.sh https://raw.githubusercontent.com/yourusername/pihole-reconnect/main/reconnect_router.sh
+wget -O reconnect_router.sh https://raw.githubusercontent.com/Phatnoir/pi-hole-wireless-reconnect/updated_logic/reconnect_router.sh #<-----remember to change this when merge with main
 sudo mv reconnect_router.sh /usr/local/bin/
 sudo chmod +x /usr/local/bin/reconnect_router.sh
 
@@ -45,20 +67,7 @@ sudo systemctl start reconnect_router.service
 sudo systemctl status reconnect_router.service
 ```
 
-## Table of Contents
-- [Quick Start](#quick-start)
-- [Features](#features)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Configuration](#configuration)
-  - [Basic Configuration](#basic-configuration)
-  - [Advanced Configuration](#advanced-configuration)
-- [Usage](#usage)
-- [Monitoring and Logs](#monitoring-and-logs)
-- [Troubleshooting](#troubleshooting)
-- [Uninstallation](#uninstallation)
-- [License](#license)
-- [Contributing](#contributing)
+</details>
 
 ## Features
 
