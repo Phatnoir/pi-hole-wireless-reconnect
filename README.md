@@ -4,7 +4,49 @@ A robust Bash script that monitors network connectivity on a Pi-hole device, aut
 
 >This script is an independent project and is not associated with or supported by the Pi-hole team.
 
+## Quick Start
+
+```bash
+# 1. Install dependencies
+sudo apt update && sudo apt install -y postfix mailutils libc-bin
+
+# 2. Get the script
+wget -O reconnect_router.sh https://raw.githubusercontent.com/yourusername/pihole-reconnect/main/reconnect_router.sh
+sudo mv reconnect_router.sh /usr/local/bin/
+sudo chmod +x /usr/local/bin/reconnect_router.sh
+
+# 3. Configure your settings (required)
+sudo nano /usr/local/bin/reconnect_router.sh
+# Edit ROUTER_IP, INTERFACE, PHONE_NUMBER, and CARRIER_GATEWAY
+
+# 4. Create service file
+sudo tee /etc/systemd/system/reconnect_router.service > /dev/null << EOL
+[Unit]
+Description=Pi-hole Wireless Reconnect Script
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/bin/reconnect_router.sh
+Restart=always
+RestartSec=30
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+# 5. Enable and start the service
+sudo systemctl enable reconnect_router.service
+sudo systemctl start reconnect_router.service
+
+# 6. Check status
+sudo systemctl status reconnect_router.service
+```
+
 ## Table of Contents
+- [Quick Start](#quick-start)
 - [Features](#features)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
@@ -98,9 +140,11 @@ Add the following content:
 ```ini
 [Unit]
 Description=Pi-hole Wireless Reconnect Script
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
+ExecStartPre=/bin/sleep 10
 ExecStart=/usr/local/bin/reconnect_router.sh
 Restart=always
 RestartSec=30
@@ -110,7 +154,11 @@ User=root
 WantedBy=multi-user.target
 ```
 
-> **Note:** The service uses `Restart=always` with `RestartSec=30` to prevent excessive restart cycles.
+> **Note:** The service configuration includes these important features:
+> - Waits for full network connectivity before starting with `network-online.target`
+> - Includes a 10-second delay before startup with `ExecStartPre=/bin/sleep 10` to ensure network services are fully initialized
+> - Uses `Restart=always` with `RestartSec=30` to prevent excessive restart cycles
+> - Runs as root to ensure proper access to networking commands
 
 Enable and start the service:
 
@@ -161,6 +209,37 @@ sudo systemctl start reconnect_router.service
 </details>
 
 ### Advanced Configuration
+
+<details>
+<summary><strong>Systemd Service Configuration</strong></summary>
+
+The systemd service file is configured with several important features:
+
+```ini
+[Unit]
+Description=Pi-hole Wireless Reconnect Script
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/bin/reconnect_router.sh
+Restart=always
+RestartSec=30
+User=root
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Key features:
+- `After=network-online.target` and `Wants=network-online.target`: Ensures that the service waits for network connectivity to be established before starting
+- `ExecStartPre=/bin/sleep 10`: Adds a 10-second delay before starting the script to ensure all network services are fully initialized
+- `Restart=always`: Automatically restarts the service if it exits for any reason
+- `RestartSec=30`: Waits 30 seconds between restart attempts to prevent excessive restart cycles
+
+This configuration helps to address startup timing issues that could occur when the network interface isn't fully ready when the script starts.
+</details>
 
 <details>
 <summary><strong>Startup Notification Management</strong></summary>
@@ -270,6 +349,9 @@ sudo systemctl start reconnect_router.service
 
 # Check status
 sudo systemctl status reconnect_router.service
+
+# View logs in real-time
+sudo journalctl -fu reconnect_router.service
 ```
 
 ## Monitoring and Logs
@@ -288,6 +370,9 @@ tail -f /var/log/router_downtime.log
 
 # View heartbeat activity
 tail -f /var/log/router_heartbeat.log
+
+# View systemd service logs
+sudo journalctl -fu reconnect_router.service
 ```
 </details>
 
@@ -348,14 +433,44 @@ The script sends different types of alerts:
 - Verify script permissions: `sudo chmod +x /usr/local/bin/reconnect_router.sh`
 - Check for error messages: `sudo journalctl -u reconnect_router.service`
 - Look for information in the self-test output in the main log
+- Verify that your `network-online.target` is functioning correctly with: `systemctl status network-online.target`
+</details>
+
+<details>
+<summary><strong>Service starting before network is ready</strong></summary>
+
+If you're experiencing issues with the service starting before the network is fully initialized:
+
+1. Verify your current service configuration has proper dependencies:
+   ```bash
+   sudo grep -A 10 "After" /etc/systemd/system/reconnect_router.service
+   ```
+
+2. The output should show:
+   ```
+   After=network-online.target
+   Wants=network-online.target
+   ```
+
+3. If needed, increase the pre-sleep delay:
+   ```bash
+   sudo sed -i 's/ExecStartPre=\/bin\/sleep 10/ExecStartPre=\/bin\/sleep 30/' /etc/systemd/system/reconnect_router.service
+   ```
+
+4. Apply changes:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl restart reconnect_router.service
+   ```
 </details>
 
 <details>
 <summary><strong>Multiple start notifications</strong></summary>
 
-- If you're receiving multiple [START] notifications, check if your systemd service is set to `Restart=always` instead of `Restart=on-failure`
+- If you're receiving multiple [START] notifications, check if your systemd service is restarting frequently
 - Verify the `STARTUP_THRESHOLD` value (default 300 seconds) is appropriate for your environment
 - Check logs for signs of script crashes causing frequent restarts
+- Look for abnormal termination in the journal: `sudo journalctl -u reconnect_router.service | grep terminated`
 </details>
 
 <details>
