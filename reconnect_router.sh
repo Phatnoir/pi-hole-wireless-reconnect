@@ -36,6 +36,9 @@ MAX_INTERNET_FAILURES=5
 # Lock file
 LOCK_FILE="/tmp/reconnect_router.lock"
 
+# Last termination reason log
+LAST_TERM_REASON_FILE="/tmp/reconnect_router_last_term.log"
+
 # Function to log messages (define early for diagnostic use)
 log_message() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
@@ -43,10 +46,16 @@ log_message() {
     echo "$timestamp - $1"
 }
 
-# Advanced diagnostic logging
+# Advanced diagnostic logging - IMPROVED to avoid recursive logging
 log_message "Script started with PID $$"
 log_message "Command line: $0 $@"
-log_message "Last terminated reason: $(journalctl -u reconnect_router.service -n 20 | grep -i 'terminated' | tail -1 2>/dev/null || echo 'Not available')"
+
+# Get last terminated reason without recursive accumulation
+if journalctl -u reconnect_router.service -n 20 | grep -i 'terminated' | tail -1 > "$LAST_TERM_REASON_FILE" 2>/dev/null; then
+    log_message "Last terminated reason: $(cat "$LAST_TERM_REASON_FILE" 2>/dev/null || echo 'Not available')"
+else
+    log_message "Last terminated reason: Not available"
+fi
 
 # Check for startup frequency - NEW
 STARTUP_CHECK_FILE="/tmp/reconnect_router_last_start"
@@ -362,16 +371,16 @@ check_connection() {
         ((INTERNET_FAILURES++))
         
         if [ "$INTERNET_FAILURES" -ge "$MAX_INTERNET_FAILURES" ]; then
-            log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — stopping retries temporarily"
+            log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — backing off temporarily"
             sleep $((RETRY_DELAY * 5)) # Back off more aggressively for internet issues
             INTERNET_FAILURES=0
         fi
-        return 1
+        return 2  # New return code: can reach router but not internet
     else
         INTERNET_FAILURES=0
     fi
 
-    return 0
+    return 0  # Success - can reach both router and internet
 }
 
 # Function to restart network interface
@@ -544,7 +553,11 @@ while true; do
         last_heartbeat_check=$current_time
     fi
     
-    if ! check_connection; then
+    # Check connection with enhanced return code handling
+    connection_status=$(check_connection)
+    connection_code=$?
+    
+    if [ $connection_code -eq 1 ]; then  # Cannot reach router
         ((consecutive_failures++))
         
         # Cap consecutive_failures to avoid unbounded backoff
@@ -577,7 +590,12 @@ while true; do
 
                 restart_interface
 
-                if check_connection; then
+                # Check connection again after restart attempt
+                check_connection
+                current_status=$?
+                
+                # If we can reach router (even if we can't reach internet), consider it a partial success
+                if [ $current_status -eq 0 ] || [ $current_status -eq 2 ]; then
                     up_time=$(date '+%Y-%m-%d %H:%M:%S')
                     
                     # Calculate downtime
@@ -633,6 +651,19 @@ Manual intervention required!"
                 # Reset consecutive failures to trigger a new cycle after delay
                 consecutive_failures=1
             fi
+        fi
+    elif [ $connection_code -eq 2 ]; then  # Can reach router but not internet
+        # Increment failure count but with a lower weight
+        consecutive_failures=$((consecutive_failures + 1))
+        
+        # For internet-only failures, we don't need to do a full network restart
+        # Just log and wait - no exit needed
+        log_message "Can reach router but not internet. Attempt $consecutive_failures - waiting to retry"
+        
+        # If this persists for multiple cycles, try a network restart
+        if [ $consecutive_failures -gt 5 ] && [ $((consecutive_failures % 5)) -eq 0 ]; then
+            log_message "Persistent internet connectivity issues - attempting network restart"
+            restart_interface
         fi
     else
         consecutive_failures=0
