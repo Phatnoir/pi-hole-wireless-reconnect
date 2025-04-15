@@ -335,7 +335,7 @@ process_heartbeat() {
     fi
     
     # Read last heartbeat time
-    local last_heartbeat=$(cat "$HEARTBEAT_FILE")
+    local last_heartbeat=$(cat "$HEARTBEAT_FILE" 2>/dev/null || echo "$current_time")
     local elapsed_time=$((current_time - last_heartbeat))
     
     # Check if we should update the heartbeat
@@ -376,7 +376,8 @@ check_connection() {
     # Then check if we can reach an upstream DNS server directly
     if ! ping -c 1 -W 3 $DNS_CHECK_HOST >/dev/null 2>&1; then
         log_message "Can reach router but cannot reach internet (1.1.1.1)"
-        ((INTERNET_FAILURES++))
+        INTERNET_FAILURES=${INTERNET_FAILURES:-0}
+		((INTERNET_FAILURES++))
         
         if [ "$INTERNET_FAILURES" -ge "$MAX_INTERNET_FAILURES" ]; then
             log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — backing off temporarily"
