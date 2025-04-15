@@ -1,5 +1,5 @@
 #!/bin/bash
-set -eEu  # Exit on error, ensure ERR traps are inherited, error on unset variables
+set -Eu  # Exit on error, ensure ERR traps are inherited, error on unset variables
 
 # Force UTF-8
 export LANG=en_US.UTF-8
@@ -14,6 +14,10 @@ MAX_RETRIES=10
 RETRY_DELAY=15
 PING_COUNT=2
 PING_TIMEOUT=3
+RESTART_TIME_FILE="/tmp/reconnect_last_iface_restart"
+RESTART_INTERVAL=180  # 3 minutes minimum between restarts
+DNS_CHECK_HOST="1.1.1.1"  # For connectivity verification
+SMS_INTERNET_CHECK="8.8.8.8"  # For SMS delivery checks
 
 # SMS Configuration
 PHONE_NUMBER="1234567890"  # Replace with your phone number
@@ -50,8 +54,8 @@ log_message() {
 log_message "Script started with PID $$"
 log_message "Command line: $0 $@"
 
-# Get last terminated reason without recursive accumulation
-if journalctl -u reconnect_router.service -n 20 | grep -i 'terminated' | tail -1 > "$LAST_TERM_REASON_FILE" 2>/dev/null; then
+# Get clean termination reason without recursion
+if journalctl -u reconnect_router.service --since "1 hour ago" | grep -i "terminated" | grep -v "Last terminated reason" | tail -1 > "$LAST_TERM_REASON_FILE" 2>/dev/null; then
     log_message "Last terminated reason: $(cat "$LAST_TERM_REASON_FILE" 2>/dev/null || echo 'Not available')"
 else
     log_message "Last terminated reason: Not available"
@@ -104,9 +108,13 @@ if [ -f "$LOCK_FILE" ]; then
     fi
 fi
 
-# Create a lock file to prevent multiple instances
-exec 200>"$LOCK_FILE"
+# Open FD 200 and associate it with the lock file
+exec 200>"$LOCK_FILE" || {
+    echo "ERROR: Could not open lock file $LOCK_FILE"
+    exit 1
+}
 
+# Attempt to acquire the lock
 if ! flock -n 200; then
     echo "Script is already running. Exiting."
     exit 1
@@ -216,7 +224,7 @@ send_sms() {
     fi
 
     # Try to send directly if internet is available
-    if ping -c 1 -W 2 8.8.8.8 > /dev/null 2>&1; then
+    if ping -c 1 -W 2 $SMS_INTERNET_CHECK > /dev/null 2>&1; then
         # Internet is available
 
         # If we have queued messages, process them intelligently
@@ -366,7 +374,7 @@ check_connection() {
     fi
 
     # Then check if we can reach an upstream DNS server directly
-    if ! ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+    if ! ping -c 1 -W 3 $DNS_CHECK_HOST >/dev/null 2>&1; then
         log_message "Can reach router but cannot reach internet (1.1.1.1)"
         ((INTERNET_FAILURES++))
         
@@ -511,7 +519,7 @@ cleanup() {
     log_message "Script stopped. Ensuring interface is up..."
     log_heartbeat "STOPPED" "Script terminated"
     sudo ip link set $INTERFACE up 2>/dev/null || true
-    
+
     # Clean up temp files
     rm -f /tmp/sms_queue.txt || true
     
@@ -522,7 +530,8 @@ cleanup() {
     
     exit 0
 }
-trap cleanup SIGTERM SIGINT SIGHUP EXIT
+trap 'EXIT_CODE=$?; echo "$(date) - Script stopped. Exit code: $EXIT_CODE" > /tmp/reconnect_router_debug; echo "$(date +"%Y-%m-%d %H:%M:%S") - Normal termination" > /tmp/reconnect_router_clean_exit; cleanup' EXIT
+trap cleanup SIGTERM SIGINT SIGHUP
 
 # Run self-test
 self_test || log_message "WARNING: Self-test reported issues, but continuing execution"
@@ -592,7 +601,7 @@ while true; do
 
                 # Check connection again after restart attempt
                 check_connection
-                current_status=$?
+                current_code=$?
                 
                 # If we can reach router (even if we can't reach internet), consider it a partial success
                 if [ $current_status -eq 0 ] || [ $current_status -eq 2 ]; then
@@ -662,9 +671,25 @@ Manual intervention required!"
         
         # If this persists for multiple cycles, try a network restart
         if [ $consecutive_failures -gt 5 ] && [ $((consecutive_failures % 5)) -eq 0 ]; then
-            log_message "Persistent internet connectivity issues - attempting network restart"
-            restart_interface
-        fi
+			log_message "Persistent internet connectivity issues - attempting network restart"
+
+			restart_ok=true
+
+			if [ -f "$RESTART_TIME_FILE" ]; then
+					last_restart=$(cat "$RESTART_TIME_FILE" 2>/dev/null || echo "0")
+					now=$(date +%s)
+				if (( now - last_restart < RESTART_INTERVAL )); then
+					log_message "... suppressed ..."
+					restart_ok=false
+					sleep $RETRY_DELAY
+				fi
+			fi
+
+			if $restart_ok; then
+				date +%s > "$RESTART_TIME_FILE"
+				restart_interface
+			fi
+		fi
     else
         consecutive_failures=0
     fi
