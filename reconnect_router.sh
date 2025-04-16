@@ -18,6 +18,7 @@ RESTART_TIME_FILE="/tmp/reconnect_last_iface_restart"
 RESTART_INTERVAL=180  # 3 minutes minimum between restarts
 DNS_CHECK_HOSTS=("1.1.1.1" "1.0.0.1")  # Cloudflare IPv4 redundancy
 SMS_INTERNET_CHECK="8.8.8.8"  # For SMS delivery checks
+PING_SIZE=32 #sets ping package size
 
 # SMS Configuration
 PHONE_NUMBER="1234567890"  # Replace with your phone number
@@ -224,7 +225,7 @@ send_sms() {
     fi
 
     # Try to send directly if internet is available
-    if ping -c 1 -W 2 $SMS_INTERNET_CHECK > /dev/null 2>&1; then
+    if ping -s "$PING_SIZE" -c "$PING_COUNT" -W "$PING_TIMEOUT" $SMS_INTERNET_CHECK > /dev/null 2>&1; then
         # Internet is available
 
         # If we have queued messages, process them intelligently
@@ -368,7 +369,7 @@ process_heartbeat() {
 # Function to check network connectivity
 check_connection() {
     # First check basic network connectivity to router
-    if ! ping -c $PING_COUNT -W $PING_TIMEOUT $ROUTER_IP >/dev/null 2>&1; then
+    if ! ping -s "$PING_SIZE" -c $PING_COUNT -W $PING_TIMEOUT $ROUTER_IP >/dev/null 2>&1; then
         log_message "Cannot reach router at $ROUTER_IP"
         return 1
     fi
@@ -376,7 +377,7 @@ check_connection() {
     # Then check if we can reach an upstream DNS server directly
 	internet_ok=false
 	for host in "${DNS_CHECK_HOSTS[@]}"; do
-		if ping -c 1 -W 3 "$host" > /dev/null 2>&1; then
+		if ping -s "$PING_SIZE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$host" > /dev/null 2>&1; then
 			internet_ok=true
 			break
 		fi
@@ -515,7 +516,7 @@ self_test() {
     fi
     
     # Test router reachability 
-    if ! ping -c 1 -W 2 "$ROUTER_IP" >/dev/null 2>&1; then
+    if ! ping -s "$PING_SIZE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$ROUTER_IP" >/dev/null 2>&1; then
         log_message "WARNING: Cannot reach router at $ROUTER_IP. Please verify router IP address."
     fi
     
