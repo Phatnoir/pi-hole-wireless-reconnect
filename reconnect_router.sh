@@ -16,7 +16,7 @@ PING_COUNT=2
 PING_TIMEOUT=3
 RESTART_TIME_FILE="/tmp/reconnect_last_iface_restart"
 RESTART_INTERVAL=180  # 3 minutes minimum between restarts
-DNS_CHECK_HOST="1.1.1.1"  # For connectivity verification
+DNS_CHECK_HOSTS=("1.1.1.1" "1.0.0.1")  # Cloudflare IPv4 redundancy
 SMS_INTERNET_CHECK="8.8.8.8"  # For SMS delivery checks
 
 # SMS Configuration
@@ -374,20 +374,28 @@ check_connection() {
     fi
 
     # Then check if we can reach an upstream DNS server directly
-    if ! ping -c 1 -W 3 $DNS_CHECK_HOST >/dev/null 2>&1; then
-        log_message "Can reach router but cannot reach internet (1.1.1.1)"
-        INTERNET_FAILURES=${INTERNET_FAILURES:-0}
+	internet_ok=false
+	for host in "${DNS_CHECK_HOSTS[@]}"; do
+		if ping -c 1 -W 3 "$host" > /dev/null 2>&1; then
+			internet_ok=true
+			break
+		fi
+	done
+
+	if ! $internet_ok; then
+		log_message "Can reach router but cannot reach internet (Cloudflare DNS unreachable)"
+		INTERNET_FAILURES=${INTERNET_FAILURES:-0}
 		((INTERNET_FAILURES++))
-        
-        if [ "$INTERNET_FAILURES" -ge "$MAX_INTERNET_FAILURES" ]; then
-            log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — backing off temporarily"
-            sleep $((RETRY_DELAY * 5)) # Back off more aggressively for internet issues
-            INTERNET_FAILURES=0
-        fi
-        return 2  # New return code: can reach router but not internet
-    else
-        INTERNET_FAILURES=0
-    fi
+
+		if [ "$INTERNET_FAILURES" -ge "$MAX_INTERNET_FAILURES" ]; then
+			log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — backing off temporarily"
+			sleep $((RETRY_DELAY * 5))
+			INTERNET_FAILURES=0
+		fi
+		return 2
+	else
+		INTERNET_FAILURES=0
+	fi
 
     return 0  # Success - can reach both router and internet
 }
