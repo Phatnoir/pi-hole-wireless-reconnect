@@ -488,9 +488,11 @@ The script sends different types of alerts:
 <details>
 <summary><strong>Multiple start notifications</strong></summary>
 
-- If you're receiving multiple [START] notifications, check if your systemd service is set to `Restart=always` instead of `Restart=on-failure`
-- Verify the `STARTUP_THRESHOLD` value (default 300 seconds) is appropriate for your environment
-- Check logs for signs of script crashes causing frequent restarts
+If you're receiving unexpected `[START]` notifications:
+* Confirm that your service is correctly using `Restart=always` — this is expected for continuous monitoring.
+* Check if `STARTUP_THRESHOLD` (default: 300 seconds) is set appropriately for your environment's restart frequency.
+* Review logs (`journalctl -u reconnect_router.service`) for crash loops or permission issues causing frequent service restarts.
+* If the script is restarting extremely often (multiple times per minute), this indicates a deeper problem and you should check for errors in the script's execution.
 </details>
 
 <details>
