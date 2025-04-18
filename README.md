@@ -217,6 +217,7 @@ sudo systemctl start reconnect_router.service
 - `RESTART_INTERVAL`: Minimum time between interface restarts (default: 180s = 3 minutes)
 - `DNS_CHECK_HOSTS`: Array of DNS servers to check for internet connectivity (default: Cloudflare DNS)
 - `SMS_INTERNET_CHECK`: IP address to verify internet connectivity for SMS delivery (default: 8.8.8.8)
+- `SMS_INTERNET_FAILURE_THRESHOLD`: Minimum number of consecutive internet-only failures before sending an [OK] recovery SMS (default: 10)
 </details>
 
 ### Advanced Configuration
@@ -302,6 +303,14 @@ When internet-only failures persist for multiple cycles, the script will attempt
 RESTART_TIME_FILE="/tmp/reconnect_last_iface_restart"
 RESTART_INTERVAL=180  # 3 minutes minimum between restarts
 ```
+
+Additionally, to avoid noise from short-term internet drops, recovery SMS messages are only sent after a configurable threshold:
+
+```bash
+# Alert threshold for internet-only recoveries
+SMS_INTERNET_FAILURE_THRESHOLD=10
+```
+This ensures that recovery alerts (e.g., [OK]) are only sent after prolonged internet failures.
 </details>
 
 <details>
