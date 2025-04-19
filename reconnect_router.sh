@@ -20,6 +20,7 @@ DNS_CHECK_HOSTS=("1.1.1.1" "1.0.0.1")  # Cloudflare IPv4 redundancy
 SMS_INTERNET_CHECK="8.8.8.8"  # For SMS delivery checks
 PING_SIZE=32 #sets ping package size
 INTERNET_WAS_DOWN=false
+ROUTER_WAS_DOWN=false
 LAST_INTERNET_DOWN_TIME=""
 SMS_INTERNET_FAILURE_THRESHOLD=10  # Number of consecutive internet failures before SMS alert (10 ~ 3Min; 20 ~ 9min)
 
