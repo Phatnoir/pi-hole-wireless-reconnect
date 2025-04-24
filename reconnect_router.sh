@@ -1,5 +1,5 @@
 #!/bin/bash
-set -eEu  # Exit on error, ensure ERR traps are inherited, error on unset variables
+set -Eu  # Exit on error, ensure ERR traps are inherited, error on unset variables
 
 # Force UTF-8
 export LANG=en_US.UTF-8
@@ -14,6 +14,15 @@ MAX_RETRIES=10
 RETRY_DELAY=15
 PING_COUNT=2
 PING_TIMEOUT=3
+RESTART_TIME_FILE="/tmp/reconnect_last_iface_restart"
+RESTART_INTERVAL=180  # 3 minutes minimum between restarts
+DNS_CHECK_HOSTS=("1.1.1.1" "1.0.0.1")  # Cloudflare IPv4 redundancy
+SMS_INTERNET_CHECK="8.8.8.8"  # For SMS delivery checks
+PING_SIZE=32 #sets ping package size
+INTERNET_WAS_DOWN=false
+ROUTER_WAS_DOWN=false
+LAST_INTERNET_DOWN_TIME=""
+SMS_INTERNET_FAILURE_THRESHOLD=10  # Number of consecutive internet failures before SMS alert (10 ~ 3Min; 20 ~ 9min)
 
 # SMS Configuration
 PHONE_NUMBER="1234567890"  # Replace with your phone number
@@ -36,17 +45,27 @@ MAX_INTERNET_FAILURES=5
 # Lock file
 LOCK_FILE="/tmp/reconnect_router.lock"
 
+# Last termination reason log
+LAST_TERM_REASON_FILE="/tmp/reconnect_router_last_term.log"
+
 # Function to log messages (define early for diagnostic use)
 log_message() {
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+	timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "$timestamp - $1" >> "$LOG_FILE" 2>/dev/null || echo "$timestamp - $1" >> "/tmp/reconnect_router.log"
     echo "$timestamp - $1"
 }
 
-# Advanced diagnostic logging
+# Advanced diagnostic logging - IMPROVED to avoid recursive logging
 log_message "Script started with PID $$"
-log_message "Command line: $0 $@"
-log_message "Last terminated reason: $(journalctl -u reconnect_router.service -n 20 | grep -i 'terminated' | tail -1 2>/dev/null || echo 'Not available')"
+log_message "Command line: $0 ${*}"
+
+# Get clean termination reason without recursion
+if journalctl -u reconnect_router.service --since "1 hour ago" | grep -i "terminated" | grep -v "Last terminated reason" | tail -1 > "$LAST_TERM_REASON_FILE" 2>/dev/null; then
+    log_message "Last terminated reason: $(cat "$LAST_TERM_REASON_FILE" 2>/dev/null || echo 'Not available')"
+else
+    log_message "Last terminated reason: Not available"
+fi
 
 # Check for startup frequency - NEW
 STARTUP_CHECK_FILE="/tmp/reconnect_router_last_start"
@@ -68,7 +87,7 @@ else
 fi
 
 # Update startup time
-echo $(date +%s) > "$STARTUP_CHECK_FILE"
+date +%s > "$STARTUP_CHECK_FILE"
 
 # Check for required dependencies
 for cmd in mail iconv ip ping; do
@@ -79,7 +98,7 @@ for cmd in mail iconv ip ping; do
 done
 
 # Check /tmp permissions - more portable across Unix systems
-if [ "$(ls -ld /tmp | awk '{print $1}')" != "drwxrwxrwt" ]; then
+if [ "$(stat -c %A /tmp)" != "drwxrwxrwt" ]; then
     log_message "WARNING: /tmp directory doesn't have correct permissions (1777/drwxrwxrwt). This may cause lock file issues."
     # Uncomment to automatically fix permissions:
     # sudo chmod 1777 /tmp
@@ -95,24 +114,28 @@ if [ -f "$LOCK_FILE" ]; then
     fi
 fi
 
-# Create a lock file to prevent multiple instances
-exec 200>"$LOCK_FILE"
+# Open FD 200 and associate it with the lock file
+exec 200>"$LOCK_FILE" || {
+    echo "ERROR: Could not open lock file $LOCK_FILE"
+    exit 1
+}
 
+# Attempt to acquire the lock
 if ! flock -n 200; then
     echo "Script is already running. Exiting."
     exit 1
 fi
 
 # Create lock file with PID - NEW
-echo $$ > "$LOCK_FILE"
+# echo $$ > "$LOCK_FILE" edit by GPT to stop racing
 
 # Ensure log files and directories exist with fallback to /tmp
 for LOG in "$LOG_FILE" "$DOWNTIME_LOG" "$HEARTBEAT_LOG"; do
     # Create directory if needed
-    if [ ! -d "$(dirname $LOG)" ]; then
-        if ! sudo mkdir -p "$(dirname $LOG)" 2>/dev/null; then
+    if [ ! -d "$(dirname "$LOG")" ]; then
+        if ! sudo mkdir -p "$(dirname "$LOG")" 2>/dev/null; then
             # If can't create in /var/log, fall back to /tmp
-            NEW_LOG="/tmp/$(basename $LOG)"
+            NEW_LOG="/tmp/$(basename "$LOG")"
             log_message "WARNING: Could not create directory for $LOG, falling back to $NEW_LOG"
             
             # Update variable based on name
@@ -151,7 +174,8 @@ done
 
 # Function to log downtime events
 log_downtime() {
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+	timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local event="$1"
     local duration="$2"
     
@@ -165,7 +189,8 @@ log_downtime() {
 
 # Function to log heartbeat events
 log_heartbeat() {
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+	timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local event="$1"
     
     # Format: TIMESTAMP | HEARTBEAT | EVENT | ADDITIONAL_INFO
@@ -175,14 +200,15 @@ log_heartbeat() {
 
 # Ensure heartbeat is initialized on startup
 if [ "$HEARTBEAT_ENABLED" = "true" ] && [ ! -f "$HEARTBEAT_FILE" ]; then
-    echo "$(date +%s)" > "$HEARTBEAT_FILE" 2>/dev/null || log_message "WARNING: Could not create heartbeat file"
+    date +%s > "$HEARTBEAT_FILE" 2>/dev/null || log_message "WARNING: Could not create heartbeat file"
     log_heartbeat "INITIALIZED" "Startup initialization"
 fi
 
 # Enhanced SMS function with better message queuing and retry logic
 send_sms() {
     local message="$1"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+	timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local queue_file="/tmp/sms_queue.txt"
     local message_type=""
 
@@ -207,7 +233,7 @@ send_sms() {
     fi
 
     # Try to send directly if internet is available
-    if ping -c 1 -W 2 8.8.8.8 > /dev/null 2>&1; then
+    if ping -s "$PING_SIZE" -c "$PING_COUNT" -W "$PING_TIMEOUT" $SMS_INTERNET_CHECK > /dev/null 2>&1; then
         # Internet is available
 
         # If we have queued messages, process them intelligently
@@ -217,7 +243,7 @@ send_sms() {
             # Extract the last message of each important type
             declare -A latest_msgs
             
-            while read line; do
+            while read -r line; do
                 if [[ "$line" == *"[START]"* ]]; then
                     latest_msgs["START"]="$line"
                 elif [[ "$line" == *"[ALERT]"* ]]; then
@@ -287,8 +313,7 @@ send_email_with_retry() {
     while [ $attempts -lt $max_attempts ]; do
         # Fix character encoding issues by converting to ASCII - with better error handling
         converted=$(echo -e "$message" | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || echo "$message")
-        echo "$converted" | mail -s "$EMAIL_SUBJECT" -a "Content-Type: text/plain; charset=UTF-8" "$SMS_EMAIL" 2>/dev/null
-        if [ $? -eq 0 ]; then
+        if echo "$converted" | mail -s "$EMAIL_SUBJECT" -a "Content-Type: text/plain; charset=UTF-8" "$SMS_EMAIL" 2>/dev/null; then
             success=true
             break
         fi
@@ -308,7 +333,8 @@ process_heartbeat() {
         return
     fi
     
-    local current_time=$(date +%s)
+    local current_time
+	current_time=$(date +%s)
     
     # Create heartbeat file if it doesn't exist
     if [ ! -f "$HEARTBEAT_FILE" ]; then
@@ -318,7 +344,8 @@ process_heartbeat() {
     fi
     
     # Read last heartbeat time
-    local last_heartbeat=$(cat "$HEARTBEAT_FILE")
+    local last_heartbeat
+	last_heartbeat=$(cat "$HEARTBEAT_FILE" 2>/dev/null || echo "$current_time")
     local elapsed_time=$((current_time - last_heartbeat))
     
     # Check if we should update the heartbeat
@@ -326,8 +353,8 @@ process_heartbeat() {
         # Check if we missed too many heartbeats
         if [ "$elapsed_time" -ge "$((HEARTBEAT_INTERVAL * MISSED_HEARTBEATS_THRESHOLD))" ]; then
             # We missed several heartbeats - might have been down
-            local down_time=$(date -d "@$last_heartbeat" '+%Y-%m-%d %H:%M:%S')
-            local current_time_str=$(date '+%Y-%m-%d %H:%M:%S')
+            local down_time
+			down_time=$(date -d "@$last_heartbeat" '+%Y-%m-%d %H:%M:%S')
             local hours=$((elapsed_time / 3600))
             local minutes=$(( (elapsed_time % 3600) / 60 ))
             local seconds=$((elapsed_time % 60))
@@ -351,27 +378,63 @@ process_heartbeat() {
 # Function to check network connectivity
 check_connection() {
     # First check basic network connectivity to router
-    if ! ping -c $PING_COUNT -W $PING_TIMEOUT $ROUTER_IP >/dev/null 2>&1; then
+    if ! ping -s "$PING_SIZE" -c $PING_COUNT -W $PING_TIMEOUT $ROUTER_IP >/dev/null 2>&1; then
         log_message "Cannot reach router at $ROUTER_IP"
         return 1
     fi
 
     # Then check if we can reach an upstream DNS server directly
-    if ! ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
-        log_message "Can reach router but cannot reach internet (1.1.1.1)"
-        ((INTERNET_FAILURES++))
-        
-        if [ "$INTERNET_FAILURES" -ge "$MAX_INTERNET_FAILURES" ]; then
-            log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — stopping retries temporarily"
-            sleep $((RETRY_DELAY * 5)) # Back off more aggressively for internet issues
-            INTERNET_FAILURES=0
+    internet_ok=false
+    for host in "${DNS_CHECK_HOSTS[@]}"; do
+        if ping -s "$PING_SIZE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$host" > /dev/null 2>&1; then
+            internet_ok=true
+            break
         fi
-        return 1
+    done
+
+    if [ "$internet_ok" = false ]; then
+        # Internet was previously up but now it's down - mark the time
+        if [ "$INTERNET_WAS_DOWN" = false ]; then
+            LAST_INTERNET_DOWN_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+            INTERNET_WAS_DOWN=true
+        fi
+        
+        log_message "Can reach router but cannot reach internet (none of: ${DNS_CHECK_HOSTS[*]} responded)"
+        ((INTERNET_FAILURES++))
+
+        if [ "$INTERNET_FAILURES" -ge "$MAX_INTERNET_FAILURES" ]; then
+			log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — backing off temporarily"
+    
+			if [ "$INTERNET_FAILURES" -ge "$SMS_INTERNET_FAILURE_THRESHOLD" ]; then
+				send_sms "[ALERT] Pi-hole has no internet despite router access. $INTERNET_FAILURES consecutive failures."
+			fi
+
+			sleep $((RETRY_DELAY * 5))
+			INTERNET_FAILURES=0
+		fi
+
+        return 2
     else
+        # Internet is back up - log recovery if it was previously down
+        if [ "$INTERNET_WAS_DOWN" = true ]; then
+            recovery_time=$(date '+%Y-%m-%d %H:%M:%S')
+            # Calculate duration between LAST_INTERNET_DOWN_TIME and now
+            down_time_seconds=$(date -u -d "$LAST_INTERNET_DOWN_TIME" +%s)
+            up_time_seconds=$(date -u -d "$recovery_time" +%s)
+            duration_seconds=$((up_time_seconds - down_time_seconds))
+            minutes=$((duration_seconds / 60))
+            seconds=$((duration_seconds % 60))
+            duration_str="${minutes}m ${seconds}s"
+            
+            log_message "Internet connectivity restored after $duration_str of downtime"
+            log_downtime "CONNECTION_RESTORED" "$duration_str" "Internet-only outage (router was reachable)"
+            INTERNET_WAS_DOWN=false
+        fi
+        
         INTERNET_FAILURES=0
     fi
 
-    return 0
+    return 0  # Success - can reach both router and internet
 }
 
 # Function to restart network interface
@@ -489,7 +552,7 @@ self_test() {
     fi
     
     # Test router reachability 
-    if ! ping -c 1 -W 2 "$ROUTER_IP" >/dev/null 2>&1; then
+    if ! ping -s "$PING_SIZE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$ROUTER_IP" >/dev/null 2>&1; then
         log_message "WARNING: Cannot reach router at $ROUTER_IP. Please verify router IP address."
     fi
     
@@ -502,7 +565,7 @@ cleanup() {
     log_message "Script stopped. Ensuring interface is up..."
     log_heartbeat "STOPPED" "Script terminated"
     sudo ip link set $INTERFACE up 2>/dev/null || true
-    
+
     # Clean up temp files
     rm -f /tmp/sms_queue.txt || true
     
@@ -513,7 +576,8 @@ cleanup() {
     
     exit 0
 }
-trap cleanup SIGTERM SIGINT SIGHUP EXIT
+trap 'EXIT_CODE=$?; echo "$(date) - Script stopped. Exit code: $EXIT_CODE" > /tmp/reconnect_router_debug; echo "$(date +"%Y-%m-%d %H:%M:%S") - Normal termination" > /tmp/reconnect_router_clean_exit; cleanup' EXIT
+trap cleanup SIGTERM SIGINT SIGHUP
 
 # Run self-test
 self_test || log_message "WARNING: Self-test reported issues, but continuing execution"
@@ -544,7 +608,11 @@ while true; do
         last_heartbeat_check=$current_time
     fi
     
-    if ! check_connection; then
+    # Check connection with enhanced return code handling
+    check_connection
+    connection_code=$?
+    
+    if [ $connection_code -eq 1 ]; then  # Cannot reach router
         ((consecutive_failures++))
         
         # Cap consecutive_failures to avoid unbounded backoff
@@ -577,7 +645,12 @@ while true; do
 
                 restart_interface
 
-                if check_connection; then
+                # Check connection again after restart attempt
+                check_connection
+                current_code=$?
+                
+                # If we can reach router (even if we can't reach internet), consider it a partial success
+                if [ "$current_code" -eq 0 ] || [ "$current_code" -eq 2 ]; then
                     up_time=$(date '+%Y-%m-%d %H:%M:%S')
                     
                     # Calculate downtime
@@ -634,6 +707,35 @@ Manual intervention required!"
                 consecutive_failures=1
             fi
         fi
+    elif [ $connection_code -eq 2 ]; then  # Can reach router but not internet
+        # Increment failure count but with a lower weight
+        consecutive_failures=$((consecutive_failures + 1))
+        
+        # For internet-only failures, we don't need to do a full network restart
+        # Just log and wait - no exit needed
+        log_message "Can reach router but not internet. Attempt $consecutive_failures - waiting to retry"
+        
+        # If this persists for multiple cycles, try a network restart
+        if [ $consecutive_failures -gt 5 ] && [ $((consecutive_failures % 5)) -eq 0 ]; then
+			log_message "Persistent internet connectivity issues - attempting network restart"
+
+			restart_ok=true
+
+			if [ -f "$RESTART_TIME_FILE" ]; then
+					last_restart=$(cat "$RESTART_TIME_FILE" 2>/dev/null || echo "0")
+					now=$(date +%s)
+				if (( now - last_restart < RESTART_INTERVAL )); then
+					log_message "... suppressed ..."
+					restart_ok=false
+					sleep $RETRY_DELAY
+				fi
+			fi
+
+			if $restart_ok; then
+				date +%s > "$RESTART_TIME_FILE"
+				restart_interface
+			fi
+		fi
     else
         consecutive_failures=0
     fi
