@@ -24,6 +24,9 @@ ROUTER_WAS_DOWN=false
 LAST_INTERNET_DOWN_TIME=""
 SMS_INTERNET_FAILURE_THRESHOLD=10  # Number of consecutive internet failures before SMS alert (10 ~ 3Min; 20 ~ 9min)
 
+# Added flag to prevent duplicate restoration logs
+DOWNTIME_ALREADY_LOGGED=false
+
 # SMS Configuration
 PHONE_NUMBER="1234567890"  # Replace with your phone number
 CARRIER_GATEWAY="vtext.com"  # Verizon (or AT&T: txt.att.net, T-Mobile: tmomail.net)
@@ -185,6 +188,11 @@ log_downtime() {
     
     # Also log to main log (can be commented out to reduce redundancy if desired)
     log_message "Downtime event: $event | $duration | $3"
+    
+    # Set the flag if this is a CONNECTION_RESTORED event
+    if [ "$event" = "CONNECTION_RESTORED" ]; then
+        DOWNTIME_ALREADY_LOGGED=true
+    fi
 }
 
 # Function to log heartbeat events
@@ -377,11 +385,33 @@ process_heartbeat() {
 
 # Function to check network connectivity
 check_connection() {
+    # Reset the downtime logging flag at the start of each check
+    DOWNTIME_ALREADY_LOGGED=false
+    
     # First check basic network connectivity to router
     if ! ping -s "$PING_SIZE" -c $PING_COUNT -W $PING_TIMEOUT $ROUTER_IP >/dev/null 2>&1; then
-        log_message "Cannot reach router at $ROUTER_IP"
-        return 1
-    fi
+		if [ "$ROUTER_WAS_DOWN" = false ]; then
+			ROUTER_WAS_DOWN=true
+			LAST_ROUTER_DOWN_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+		fi
+		log_message "Cannot reach router at $ROUTER_IP"
+		return 1
+	else
+		if [ "$ROUTER_WAS_DOWN" = true ]; then
+			recovery_time=$(date '+%Y-%m-%d %H:%M:%S')
+			down_time_seconds=$(date -u -d "$LAST_ROUTER_DOWN_TIME" +%s)
+			up_time_seconds=$(date -u -d "$recovery_time" +%s)
+			duration_seconds=$((up_time_seconds - down_time_seconds))
+			minutes=$((duration_seconds / 60))
+			seconds=$((duration_seconds % 60))
+			duration_str="${minutes}m ${seconds}s"
+
+			log_message "Router connectivity restored after $duration_str of downtime"
+			log_downtime "ROUTER_RESTORED" "$duration_str" "Router outage"
+			ROUTER_WAS_DOWN=false
+		fi
+	fi
+
 
     # Then check if we can reach an upstream DNS server directly
     internet_ok=false
@@ -429,7 +459,9 @@ check_connection() {
             log_message "Internet connectivity restored after $duration_str of downtime"
             log_downtime "CONNECTION_RESTORED" "$duration_str" "Internet-only outage (router was reachable)"
             INTERNET_WAS_DOWN=false
-        fi
+            # Set the flag to indicate we've already logged a restoration
+            DOWNTIME_ALREADY_LOGGED=true
+        }
         
         INTERNET_FAILURES=0
     fi
@@ -608,6 +640,9 @@ while true; do
         last_heartbeat_check=$current_time
     fi
     
+    # Reset downtime flag at the start of each loop iteration
+    DOWNTIME_ALREADY_LOGGED=false
+    
     # Check connection with enhanced return code handling
     check_connection
     connection_code=$?
@@ -664,8 +699,11 @@ while true; do
                     # Shorter message format to fit within SMS 160 character limit
                     recovery_message="[OK] Pi-hole Online! Down: ${downtime_minutes}m${downtime_seconds}s. ${i}/${MAX_RETRIES} attempts"
                     
-                    # Use only log_downtime to prevent duplicate logging
-                    log_downtime "CONNECTION_RESTORED" "$downtime_str" "$i attempts needed"
+                    # Only log downtime if it hasn't already been logged by check_connection
+                    if [ "$DOWNTIME_ALREADY_LOGGED" = false ]; then
+                        log_downtime "CONNECTION_RESTORED" "$downtime_str" "$i attempts needed"
+                    fi
+                    
                     send_sms "$recovery_message"
                     connection_was_down=false
                     consecutive_failures=0
