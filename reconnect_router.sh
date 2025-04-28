@@ -461,8 +461,7 @@ check_connection() {
             INTERNET_WAS_DOWN=false
             # Set the flag to indicate we've already logged a restoration
             DOWNTIME_ALREADY_LOGGED=true
-        }
-        
+        fi
         INTERNET_FAILURES=0
     fi
 
