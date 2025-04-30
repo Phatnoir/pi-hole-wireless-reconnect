@@ -390,27 +390,28 @@ check_connection() {
     
     # First check basic network connectivity to router
     if ! ping -s "$PING_SIZE" -c $PING_COUNT -W $PING_TIMEOUT $ROUTER_IP >/dev/null 2>&1; then
-		if [ "$ROUTER_WAS_DOWN" = false ]; then
-			ROUTER_WAS_DOWN=true
-			LAST_ROUTER_DOWN_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-		fi
-		log_message "Cannot reach router at $ROUTER_IP"
-		return 1
-	else
-		if [ "$ROUTER_WAS_DOWN" = true ]; then
-			recovery_time=$(date '+%Y-%m-%d %H:%M:%S')
-			down_time_seconds=$(date -u -d "$LAST_ROUTER_DOWN_TIME" +%s)
-			up_time_seconds=$(date -u -d "$recovery_time" +%s)
-			duration_seconds=$((up_time_seconds - down_time_seconds))
-			minutes=$((duration_seconds / 60))
-			seconds=$((duration_seconds % 60))
-			duration_str="${minutes}m ${seconds}s"
+        # FIXED: Log this message only once, when the state changes from up to down
+        if [ "$ROUTER_WAS_DOWN" = false ]; then
+            ROUTER_WAS_DOWN=true
+            LAST_ROUTER_DOWN_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+            log_message "Cannot reach router at $ROUTER_IP"
+        fi
+        return 1
+    else
+        if [ "$ROUTER_WAS_DOWN" = true ]; then
+            recovery_time=$(date '+%Y-%m-%d %H:%M:%S')
+            down_time_seconds=$(date -u -d "$LAST_ROUTER_DOWN_TIME" +%s)
+            up_time_seconds=$(date -u -d "$recovery_time" +%s)
+            duration_seconds=$((up_time_seconds - down_time_seconds))
+            minutes=$((duration_seconds / 60))
+            seconds=$((duration_seconds % 60))
+            duration_str="${minutes}m ${seconds}s"
 
-			log_message "Router connectivity restored after $duration_str of downtime"
-			log_downtime "ROUTER_RESTORED" "$duration_str" "Router outage"
-			ROUTER_WAS_DOWN=false
-		fi
-	fi
+            log_message "Router connectivity restored after $duration_str of downtime"
+            log_downtime "ROUTER_RESTORED" "$duration_str" "Router outage"
+            ROUTER_WAS_DOWN=false
+        fi
+    fi
 
 
     # Then check if we can reach an upstream DNS server directly
@@ -433,15 +434,15 @@ check_connection() {
         ((INTERNET_FAILURES++))
 
         if [ "$INTERNET_FAILURES" -ge "$MAX_INTERNET_FAILURES" ]; then
-			log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — backing off temporarily"
+            log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — backing off temporarily"
     
-			if [ "$INTERNET_FAILURES" -ge "$SMS_INTERNET_FAILURE_THRESHOLD" ]; then
-				send_sms "[ALERT] Pi-hole has no internet despite router access. $INTERNET_FAILURES consecutive failures."
-			fi
+            if [ "$INTERNET_FAILURES" -ge "$SMS_INTERNET_FAILURE_THRESHOLD" ]; then
+                send_sms "[ALERT] Pi-hole has no internet despite router access. $INTERNET_FAILURES consecutive failures."
+            fi
 
-			sleep $((RETRY_DELAY * 5))
-			INTERNET_FAILURES=0
-		fi
+            sleep $((RETRY_DELAY * 5))
+            INTERNET_FAILURES=0
+        fi
 
         return 2
     else
@@ -461,7 +462,7 @@ check_connection() {
             INTERNET_WAS_DOWN=false
             # Set the flag to indicate we've already logged a restoration
             DOWNTIME_ALREADY_LOGGED=true
-        fi
+        }
         INTERNET_FAILURES=0
     fi
 
@@ -617,6 +618,7 @@ self_test || log_message "WARNING: Self-test reported issues, but continuing exe
 connection_was_down=false
 consecutive_failures=0
 last_heartbeat_check=$(date +%s)
+saved_down_time=""  # NEW: Save the exact down time to use for recovery
 
 log_message "Network monitoring started for interface $INTERFACE"
 log_heartbeat "STARTED" "Monitoring initialization"
@@ -657,13 +659,15 @@ while true; do
         # Only trigger reconnection after 2 consecutive failures
         if [ "$consecutive_failures" -ge 2 ]; then
             if [ "$connection_was_down" = false ]; then
-                down_time=$(date '+%Y-%m-%d %H:%M:%S')
-                log_message "Network connectivity lost at $down_time"
+                # FIXED: Ensure we capture the exact time the connection went down
+                # for proper downtime calculation later
+                saved_down_time=$(date '+%Y-%m-%d %H:%M:%S')
+                log_message "Network connectivity lost at $saved_down_time"
                 log_downtime "CONNECTION_LOST" "N/A" "Starting recovery attempts"
                 
                 # Queue the alert message even though we can't send it now
                 # It will be sent once connection is restored
-                send_sms "[ALERT] Pi-hole Disconnected at $down_time"
+                send_sms "[ALERT] Pi-hole Disconnected at $saved_down_time"
                 connection_was_down=true
             fi
 
@@ -687,8 +691,8 @@ while true; do
                 if [ "$current_code" -eq 0 ] || [ "$current_code" -eq 2 ]; then
                     up_time=$(date '+%Y-%m-%d %H:%M:%S')
                     
-                    # Calculate downtime
-                    down_time_seconds=$(date -u -d "$down_time" +%s)
+                    # FIXED: Use saved_down_time for accurate downtime calculation
+                    down_time_seconds=$(date -u -d "$saved_down_time" +%s)
                     up_time_seconds=$(date -d "$up_time" +%s)
                     downtime_seconds=$((up_time_seconds - down_time_seconds))
                     downtime_minutes=$((downtime_seconds / 60))
@@ -722,14 +726,14 @@ while true; do
             if [ "$reconnect_success" = false ]; then
                 timeout_time=$(date '+%Y-%m-%d %H:%M:%S')
                 total_time_str=$(date -d "$timeout_time" +%s)
-                start_time_str=$(date -d "$down_time" +%s)
+                start_time_str=$(date -d "$saved_down_time" +%s)  # FIXED: Use saved_down_time
                 time_diff=$((total_time_str - start_time_str))
                 minutes=$((time_diff / 60))
                 seconds=$((time_diff % 60))
                 downtime_str="${minutes}m ${seconds}s"
 
                 timeout_message="[CRITICAL] Pi-hole recovery failed!
-- Down since: $down_time
+- Down since: $saved_down_time  # FIXED: Use saved_down_time
 - Current time: $timeout_time
 - Total downtime: $downtime_str
 - All $MAX_RETRIES attempts failed
@@ -754,25 +758,25 @@ Manual intervention required!"
         
         # If this persists for multiple cycles, try a network restart
         if [ $consecutive_failures -gt 5 ] && [ $((consecutive_failures % 5)) -eq 0 ]; then
-			log_message "Persistent internet connectivity issues - attempting network restart"
+            log_message "Persistent internet connectivity issues - attempting network restart"
 
-			restart_ok=true
+            restart_ok=true
 
-			if [ -f "$RESTART_TIME_FILE" ]; then
-					last_restart=$(cat "$RESTART_TIME_FILE" 2>/dev/null || echo "0")
-					now=$(date +%s)
-				if (( now - last_restart < RESTART_INTERVAL )); then
-					log_message "... suppressed ..."
-					restart_ok=false
-					sleep $RETRY_DELAY
-				fi
-			fi
+            if [ -f "$RESTART_TIME_FILE" ]; then
+                last_restart=$(cat "$RESTART_TIME_FILE" 2>/dev/null || echo "0")
+                now=$(date +%s)
+                if (( now - last_restart < RESTART_INTERVAL )); then
+                    log_message "... suppressed ..."
+                    restart_ok=false
+                    sleep $RETRY_DELAY
+                fi
+            fi
 
-			if $restart_ok; then
-				date +%s > "$RESTART_TIME_FILE"
-				restart_interface
-			fi
-		fi
+            if $restart_ok; then
+                date +%s > "$RESTART_TIME_FILE"
+                restart_interface
+            fi
+        fi
     else
         consecutive_failures=0
     fi
