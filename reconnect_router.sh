@@ -28,7 +28,7 @@ SMS_INTERNET_FAILURE_THRESHOLD=10  # Number of consecutive internet failures bef
 DOWNTIME_ALREADY_LOGGED=false
 
 # SMS Configuration
-PHONE_NUMBER="5055042938"  # Replace with your phone number
+PHONE_NUMBER="123456789"  # Replace with your phone number
 CARRIER_GATEWAY="vtext.com"  # Verizon (or AT&T: txt.att.net, T-Mobile: tmomail.net)
 SMS_EMAIL="$PHONE_NUMBER@$CARRIER_GATEWAY"
 EMAIL_SUBJECT="Pi-hole Alert"
