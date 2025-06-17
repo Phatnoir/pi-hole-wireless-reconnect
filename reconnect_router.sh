@@ -12,6 +12,7 @@ LOG_FILE="/var/log/reconnect_router.log"
 DOWNTIME_LOG="/var/log/router_downtime.log" # New: dedicated log for tracking downtime events
 MAX_RETRIES=10
 RETRY_DELAY=15
+ROUTER_FAILURE_THRESHOLD=2  # Number of consecutive failures before triggering reconnection attempts
 PING_COUNT=2
 PING_TIMEOUT=3
 RESTART_TIME_FILE="/tmp/reconnect_last_iface_restart"
@@ -656,8 +657,8 @@ while true; do
             consecutive_failures=10
         fi
 
-        # Only trigger reconnection after 2 consecutive failures
-        if [ "$consecutive_failures" -ge 2 ]; then
+        # Only trigger reconnection after $ROUTER_FAILURE_THRESHOLD consecutive failures
+        if [ "$consecutive_failures" -ge "$ROUTER_FAILURE_THRESHOLD" ]; then
             if [ "$connection_was_down" = false ]; then
                 # FIXED: Ensure we capture the exact time the connection went down
                 # for proper downtime calculation later
