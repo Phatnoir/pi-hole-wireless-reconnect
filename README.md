@@ -26,7 +26,7 @@ A robust Bash script that monitors network connectivity on a Pi-hole device, aut
 
 ```bash
 # 1. Install dependencies
-sudo apt update && sudo apt install -y postfix mailutils libc-bin
+sudo apt update && sudo apt install -y postfix mailutils libc-bin ethtool
 
 # 👉 If using Gmail as your mail relay, you'll also need to:
 #    - Create an App Password: https://myaccount.google.com/apppasswords
