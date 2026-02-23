@@ -101,6 +101,11 @@ for cmd in mail iconv ip ping; do
     fi
 done
 
+# Check for optional but recommended dependencies
+if ! command -v ethtool >/dev/null; then
+    log_message "WARNING: 'ethtool' not found. MAC address restoration will be skipped. Install with: sudo apt install ethtool"
+fi
+
 # Check /tmp permissions - more portable across Unix systems
 if [ "$(stat -c %A /tmp)" != "drwxrwxrwt" ]; then
     log_message "WARNING: /tmp directory doesn't have correct permissions (1777/drwxrwxrwt). This may cause lock file issues."
@@ -520,6 +525,21 @@ restart_interface() {
         }
     else
         log_message "Interface is down, skipping IP address flush"
+    fi
+
+    # Restore hardware MAC address before bringing interface up
+    # Prevents MAC randomization from causing DHCP failures (router rejects unknown MACs)
+    if command -v ethtool >/dev/null; then
+        HARDWARE_MAC=$(sudo ethtool -P "$INTERFACE" 2>/dev/null | awk '{print $3}')
+        if [ -n "$HARDWARE_MAC" ]; then
+            log_message "Restoring hardware MAC address: $HARDWARE_MAC"
+            sudo ip link set "$INTERFACE" address "$HARDWARE_MAC" 2>/dev/null || \
+                log_message "WARNING: Could not restore hardware MAC address"
+        else
+            log_message "WARNING: Could not retrieve hardware MAC address from ethtool"
+        fi
+    else
+        log_message "WARNING: ethtool not available, skipping MAC restoration (random MAC may cause DHCP failure)"
     fi
 
     # Bring interface up
