@@ -24,7 +24,7 @@ A robust Bash script that monitors network connectivity on a Pi-hole device, aut
 <details>
 <summary><strong>Click to expand Quick Start</strong></summary>
 
-```bash
+<pre><code>
 # 1. Install dependencies
 sudo apt update && sudo apt install -y postfix mailutils libc-bin ethtool
 
@@ -65,7 +65,7 @@ sudo systemctl start reconnect_router.service
 
 # 6. Check status
 sudo systemctl status reconnect_router.service
-```
+</code></pre>
 
 </details>
 
