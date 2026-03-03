@@ -1,5 +1,5 @@
 #!/bin/bash
-set -Eu  # Exit on error, ensure ERR traps are inherited, error on unset variables
+set -Eeuo pipefail  # -e: exit on error, -E: inherit ERR traps, -u: error on unset vars, -o pipefail: catch pipe failures
 
 # Force UTF-8
 export LANG=en_US.UTF-8
@@ -12,7 +12,7 @@ LOG_FILE="/var/log/reconnect_router.log"
 DOWNTIME_LOG="/var/log/router_downtime.log" # New: dedicated log for tracking downtime events
 MAX_RETRIES=10
 RETRY_DELAY=15
-ROUTER_FAILURE_THRESHOLD=2  # Number of consecutive failures before triggering reconnection attempts (router unreachable)
+ROUTER_FAILURE_THRESHOLD=4  # Number of consecutive failures before triggering reconnection attempts (~60s at 15s RETRY_DELAY)
 PING_COUNT=2
 PING_TIMEOUT=3
 RESTART_TIME_FILE="/tmp/reconnect_last_iface_restart"
@@ -23,6 +23,7 @@ PING_SIZE=32 #sets ping package size
 INTERNET_WAS_DOWN=false
 ROUTER_WAS_DOWN=false
 LAST_INTERNET_DOWN_TIME=""
+LAST_ROUTER_DOWN_TIME=""
 SMS_INTERNET_FAILURE_THRESHOLD=10  # Number of consecutive internet failures before SMS alert (10 ~ 3Min; 20 ~ 9min)
 
 # Added flag to prevent duplicate restoration logs
@@ -94,7 +95,7 @@ fi
 date +%s > "$STARTUP_CHECK_FILE"
 
 # Check for required dependencies
-for cmd in mail iconv ip ping; do
+for cmd in mail iconv ip ping flock wpa_cli iw; do
     if ! command -v $cmd >/dev/null; then
         echo "ERROR: Required command '$cmd' not found. Please install the necessary package."
         exit 1
@@ -135,14 +136,15 @@ if ! flock -n 200; then
     exit 1
 fi
 
-# Create lock file with PID - NEW
-# echo $$ > "$LOCK_FILE" edit by GPT to stop racing
+# Write PID into the lock file after acquiring it (safe - no race with flock held).
+# Writing to FD 200 writes to the underlying file; stale-lock check reads the same file.
+echo $$ >&200
 
 # Ensure log files and directories exist with fallback to /tmp
 for LOG in "$LOG_FILE" "$DOWNTIME_LOG" "$HEARTBEAT_LOG"; do
     # Create directory if needed
     if [ ! -d "$(dirname "$LOG")" ]; then
-        if ! sudo mkdir -p "$(dirname "$LOG")" 2>/dev/null; then
+        if ! mkdir -p "$(dirname "$LOG")" 2>/dev/null; then
             # If can't create in /var/log, fall back to /tmp
             NEW_LOG="/tmp/$(basename "$LOG")"
             log_message "WARNING: Could not create directory for $LOG, falling back to $NEW_LOG"
@@ -161,11 +163,11 @@ for LOG in "$LOG_FILE" "$DOWNTIME_LOG" "$HEARTBEAT_LOG"; do
     
     # Touch the file if it doesn't exist
     if [ ! -f "$LOG" ]; then
-        if ! sudo touch "$LOG" 2>/dev/null || ! sudo chown "$(whoami)" "$LOG" 2>/dev/null; then
+        if ! touch "$LOG" 2>/dev/null || ! chown "$(whoami)" "$LOG" 2>/dev/null; then
             log_message "WARNING: Could not create or set permissions for $LOG"
         else
             # Set explicit permissions
-            sudo chmod 644 "$LOG" 2>/dev/null || true
+            chmod 644 "$LOG" 2>/dev/null || true
         fi
     fi
     
@@ -177,7 +179,7 @@ for LOG in "$LOG_FILE" "$DOWNTIME_LOG" "$HEARTBEAT_LOG"; do
     # Add log rotation check
     if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -ge 10485760 ]; then
         log_message "Log file $LOG has grown too large, rotating"
-        sudo mv "$LOG" "$LOG.$(date '+%Y%m%d%H%M%S')" 2>/dev/null || true
+        mv "$LOG" "$LOG.$(date '+%Y%m%d%H%M%S')" 2>/dev/null || true
     fi
 done
 
@@ -391,36 +393,9 @@ process_heartbeat() {
 
 # Function to check network connectivity
 check_connection() {
-    # Reset the downtime logging flag at the start of each check
-    DOWNTIME_ALREADY_LOGGED=false
-    
-    # First check basic network connectivity to router
-    if ! ping -s "$PING_SIZE" -c $PING_COUNT -W $PING_TIMEOUT $ROUTER_IP >/dev/null 2>&1; then
-        # FIXED: Log this message only once, when the state changes from up to down
-        if [ "$ROUTER_WAS_DOWN" = false ]; then
-            ROUTER_WAS_DOWN=true
-            LAST_ROUTER_DOWN_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-            log_message "Cannot reach router at $ROUTER_IP"
-        fi
-        return 1
-    else
-        if [ "$ROUTER_WAS_DOWN" = true ]; then
-            recovery_time=$(date '+%Y-%m-%d %H:%M:%S')
-            down_time_seconds=$(date -u -d "$LAST_ROUTER_DOWN_TIME" +%s)
-            up_time_seconds=$(date -u -d "$recovery_time" +%s)
-            duration_seconds=$((up_time_seconds - down_time_seconds))
-            minutes=$((duration_seconds / 60))
-            seconds=$((duration_seconds % 60))
-            duration_str="${minutes}m ${seconds}s"
-
-            log_message "Router connectivity restored after $duration_str of downtime"
-            log_downtime "ROUTER_RESTORED" "$duration_str" "Router outage"
-            ROUTER_WAS_DOWN=false
-        fi
-    fi
-
-
-    # Then check if we can reach an upstream DNS server directly
+    # Check upstream internet FIRST. If we can reach 1.1.1.1, Wi-Fi is working
+    # regardless of whether the router responds to ICMP. This prevents router
+    # ping blips from accumulating consecutive_failures and causing false restarts.
     internet_ok=false
     for host in "${DNS_CHECK_HOSTS[@]}"; do
         if ping -s "$PING_SIZE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$host" > /dev/null 2>&1; then
@@ -429,19 +404,57 @@ check_connection() {
         fi
     done
 
-    if [ "$internet_ok" = false ]; then
-        # Internet was previously up but now it's down - mark the time
+    if [ "$internet_ok" = true ]; then
+        # Internet is reachable - handle recovery logging for any prior outage
+        if [ "$ROUTER_WAS_DOWN" = true ]; then
+            recovery_time=$(date '+%Y-%m-%d %H:%M:%S')
+            down_time_seconds=$(date -u -d "$LAST_ROUTER_DOWN_TIME" +%s)
+            up_time_seconds=$(date -u -d "$recovery_time" +%s)
+            duration_seconds=$((up_time_seconds - down_time_seconds))
+            minutes=$((duration_seconds / 60))
+            seconds=$((duration_seconds % 60))
+            log_message "Router connectivity restored after ${minutes}m ${seconds}s of downtime"
+            log_downtime "ROUTER_RESTORED" "${minutes}m ${seconds}s" "Router outage"
+            ROUTER_WAS_DOWN=false
+        fi
+        if [ "$INTERNET_WAS_DOWN" = true ]; then
+            recovery_time=$(date '+%Y-%m-%d %H:%M:%S')
+            down_time_seconds=$(date -u -d "$LAST_INTERNET_DOWN_TIME" +%s)
+            up_time_seconds=$(date -u -d "$recovery_time" +%s)
+            duration_seconds=$((up_time_seconds - down_time_seconds))
+            minutes=$((duration_seconds / 60))
+            seconds=$((duration_seconds % 60))
+            log_message "Internet connectivity restored after ${minutes}m ${seconds}s of downtime"
+            log_downtime "CONNECTION_RESTORED" "${minutes}m ${seconds}s" "Internet-only outage (router was reachable)"
+            INTERNET_WAS_DOWN=false
+            DOWNTIME_ALREADY_LOGGED=true
+        fi
+        INTERNET_FAILURES=0
+        return 0  # Internet reachable - all good
+    fi
+
+    # Internet not reachable - check router to distinguish Wi-Fi failure from ISP issue
+    if ! ping -s "$PING_SIZE" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$ROUTER_IP" >/dev/null 2>&1; then
+        # Neither internet nor router reachable - likely Wi-Fi is down
+        if [ "$ROUTER_WAS_DOWN" = false ]; then
+            ROUTER_WAS_DOWN=true
+            LAST_ROUTER_DOWN_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+            log_message "Cannot reach router at $ROUTER_IP"
+        fi
+        return 1
+    else
+        # Router reachable but no internet - ISP issue, don't restart Wi-Fi
         if [ "$INTERNET_WAS_DOWN" = false ]; then
             LAST_INTERNET_DOWN_TIME=$(date '+%Y-%m-%d %H:%M:%S')
             INTERNET_WAS_DOWN=true
         fi
-        
+
         log_message "Can reach router but cannot reach internet (none of: ${DNS_CHECK_HOSTS[*]} responded)"
         ((INTERNET_FAILURES++))
 
         if [ "$INTERNET_FAILURES" -ge "$MAX_INTERNET_FAILURES" ]; then
             log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — backing off temporarily"
-    
+
             if [ "$INTERNET_FAILURES" -ge "$SMS_INTERNET_FAILURE_THRESHOLD" ]; then
                 send_sms "[ALERT] Pi-hole has no internet despite router access. $INTERNET_FAILURES consecutive failures."
             fi
@@ -451,89 +464,33 @@ check_connection() {
         fi
 
         return 2
-    else
-        # Internet is back up - log recovery if it was previously down
-        if [ "$INTERNET_WAS_DOWN" = true ]; then
-            recovery_time=$(date '+%Y-%m-%d %H:%M:%S')
-            # Calculate duration between LAST_INTERNET_DOWN_TIME and now
-            down_time_seconds=$(date -u -d "$LAST_INTERNET_DOWN_TIME" +%s)
-            up_time_seconds=$(date -u -d "$recovery_time" +%s)
-            duration_seconds=$((up_time_seconds - down_time_seconds))
-            minutes=$((duration_seconds / 60))
-            seconds=$((duration_seconds % 60))
-            duration_str="${minutes}m ${seconds}s"
-            
-            log_message "Internet connectivity restored after $duration_str of downtime"
-            log_downtime "CONNECTION_RESTORED" "$duration_str" "Internet-only outage (router was reachable)"
-            INTERNET_WAS_DOWN=false
-            # Set the flag to indicate we've already logged a restoration
-            DOWNTIME_ALREADY_LOGGED=true
-        fi
-        INTERNET_FAILURES=0
     fi
-
-    return 0  # Success - can reach both router and internet
 }
 
-# Function to restart network interface
+# Function to restart network interface (link bounce only - dhcpcd manages DHCP)
 restart_interface() {
     log_message "Attempting to restart $INTERFACE..."
-    
-    # Check if interface exists
+
     if ! ip link show "$INTERFACE" >/dev/null 2>&1; then
         log_message "ERROR: Interface $INTERFACE does not exist"
         return 1
     fi
 
-    # Kill any hanging DHCP client processes
-    sudo pkill dhclient 2>/dev/null || true
-    sleep 1
-
-    # Detect DHCP client type
-    DHCP_CLIENT=""
-    if command -v dhclient >/dev/null; then
-        DHCP_CLIENT="dhclient"
-    elif command -v dhcpcd >/dev/null; then
-        DHCP_CLIENT="dhcpcd"
-    else
-        log_message "WARNING: No DHCP client found."
-    fi
-
-    # Release DHCP lease based on client type
-    if [ "$DHCP_CLIENT" = "dhclient" ]; then
-        log_message "Releasing DHCP lease with dhclient"
-        sudo dhclient -v -r $INTERFACE 2>/dev/null || true
-    elif [ "$DHCP_CLIENT" = "dhcpcd" ]; then
-        log_message "Releasing DHCP lease with dhcpcd"
-        sudo dhcpcd -k $INTERFACE 2>/dev/null || true
-    fi
-    sleep 2
-
-    # Bring interface down
+    # Bring interface down - dhcpcd detects carrier loss and cleans up IP/routes automatically
     log_message "Bringing interface down"
-    sudo ip link set $INTERFACE down || {
+    ip link set $INTERFACE down || {
         log_message "ERROR: Failed to bring interface down"
         return 1
     }
     sleep 2
 
-    # Clear IP address
-    log_message "Flushing IP address"
-    if ip link show "$INTERFACE" | grep -q 'UP'; then
-        sudo ip addr flush dev $INTERFACE || {
-            log_message "ERROR: Failed to flush IP address"
-        }
-    else
-        log_message "Interface is down, skipping IP address flush"
-    fi
-
-    # Restore hardware MAC address before bringing interface up
-    # Prevents MAC randomization from causing DHCP failures (router rejects unknown MACs)
+    # Restore hardware MAC address before bringing interface up.
+    # Prevents MAC randomization from causing DHCP failures (router rejects unknown MACs).
     if command -v ethtool >/dev/null; then
-        HARDWARE_MAC=$(sudo ethtool -P "$INTERFACE" 2>/dev/null | awk '{print $3}')
+        HARDWARE_MAC=$(ethtool -P "$INTERFACE" 2>/dev/null | awk '{print $3}')
         if [ -n "$HARDWARE_MAC" ]; then
             log_message "Restoring hardware MAC address: $HARDWARE_MAC"
-            sudo ip link set "$INTERFACE" address "$HARDWARE_MAC" 2>/dev/null || \
+            ip link set "$INTERFACE" address "$HARDWARE_MAC" 2>/dev/null || \
                 log_message "WARNING: Could not restore hardware MAC address"
         else
             log_message "WARNING: Could not retrieve hardware MAC address from ethtool"
@@ -542,34 +499,21 @@ restart_interface() {
         log_message "WARNING: ethtool not available, skipping MAC restoration (random MAC may cause DHCP failure)"
     fi
 
-    # Bring interface up
+    # Bring interface up - dhcpcd will detect carrier and re-acquire the lease automatically
     log_message "Bringing interface up"
-    sudo ip link set $INTERFACE up || {
+    ip link set $INTERFACE up || {
         log_message "ERROR: Failed to bring interface up"
         return 1
     }
-    sleep 5
 
-    # Get new IP address based on client type
-    if [ "$DHCP_CLIENT" = "dhclient" ]; then
-        log_message "Requesting new IP with dhclient"
-        sudo dhclient -v $INTERFACE || {
-            log_message "ERROR: dhclient failed to get IP"
-        }
-    elif [ "$DHCP_CLIENT" = "dhcpcd" ]; then
-        log_message "Requesting new IP with dhcpcd"
-        sudo dhcpcd $INTERFACE || {
-            log_message "ERROR: dhcpcd failed to get IP"
-        }
-    else
-        log_message "No DHCP client available. Waiting for system to assign IP."
-        # Some systems will automatically assign an IP when the interface comes up
-        sleep 10
-    fi
+    # Disable Wi-Fi power save - brcmfmac re-enables it on every link-up and it can
+    # cause intermittent ping drops that trigger false reconnection cycles
+    iw dev "$INTERFACE" set power_save off 2>/dev/null && \
+        log_message "Wi-Fi power save disabled" || \
+        log_message "WARNING: Could not disable Wi-Fi power save (iw not available?)"
 
-    # Wait for interface to stabilize
-    sleep 5
-    
+    sleep 10  # Give dhcpcd time to re-acquire address
+
     # Verify we have an IP
     if ! ip addr show dev "$INTERFACE" | grep -q 'inet '; then
         log_message "WARNING: No IP address assigned to $INTERFACE after restart"
@@ -599,9 +543,9 @@ self_test() {
         done
     fi
     
-    # Test DHCP client availability
-    if ! command -v dhclient >/dev/null && ! command -v dhcpcd >/dev/null; then
-        log_message "WARNING: No DHCP client (dhclient or dhcpcd) found. Network restart may fail."
+    # Test DHCP client availability (dhcpcd is required; script no longer uses dhclient)
+    if ! command -v dhcpcd >/dev/null; then
+        log_message "WARNING: dhcpcd not found. Network restart may not re-acquire an IP automatically."
     fi
     
     # Test router reachability 
@@ -617,19 +561,17 @@ self_test() {
 cleanup() {
     log_message "Script stopped. Ensuring interface is up..."
     log_heartbeat "STOPPED" "Script terminated"
-    sudo ip link set $INTERFACE up 2>/dev/null || true
+    ip link set $INTERFACE up 2>/dev/null || true
 
     # Clean up temp files
     rm -f /tmp/sms_queue.txt || true
     
-    # Release and remove the lock file
-    rm -f "$LOCK_FILE" || true
+    # Release lock first, then remove the file
     flock -u 200 || true
     exec 200>&- || true
-    
-    exit 0
+    rm -f "$LOCK_FILE" || true
 }
-trap 'EXIT_CODE=$?; echo "$(date) - Script stopped. Exit code: $EXIT_CODE" > /tmp/reconnect_router_debug; echo "$(date +"%Y-%m-%d %H:%M:%S") - Normal termination" > /tmp/reconnect_router_clean_exit; cleanup' EXIT
+trap 'EXIT_CODE=$?; echo "$(date) - Script stopped. Exit code: $EXIT_CODE" > /tmp/reconnect_router_debug; echo "$(date +"%Y-%m-%d %H:%M:%S") - Normal termination" > /tmp/reconnect_router_clean_exit; cleanup; exit $EXIT_CODE' EXIT
 trap cleanup SIGTERM SIGINT SIGHUP
 
 # Run self-test
@@ -692,7 +634,10 @@ while true; do
                 connection_was_down=true
             fi
 
-            # Try multiple times to reconnect
+            # Try multiple times to reconnect using a graduated recovery ladder:
+            #   attempts 1-3:  wpa_cli reconnect (soft, no disruption)
+            #   attempts 4-7:  link bounce        (dhcpcd handles DHCP)
+            #   attempts 8+:   restart dhcpcd     (nuclear option)
             reconnect_success=false
             for ((i=1; i<=MAX_RETRIES; i++)); do
                 log_message "Reconnection attempt $i of $MAX_RETRIES"
@@ -702,7 +647,19 @@ while true; do
                     send_sms "[TRYING] Pi-hole reconnection attempt $i of $MAX_RETRIES"
                 fi
 
-                restart_interface
+                if [ "$i" -le 3 ]; then
+                    log_message "Recovery level 1: soft wpa_cli reconnect"
+                    wpa_cli -i "$INTERFACE" reconnect 2>/dev/null || true
+                    sleep 10
+                elif [ "$i" -le 7 ]; then
+                    log_message "Recovery level 2: link bounce (dhcpcd manages DHCP)"
+                    restart_interface
+                else
+                    log_message "Recovery level 3: restarting dhcpcd service"
+                    systemctl restart dhcpcd 2>/dev/null || \
+                        log_message "WARNING: Failed to restart dhcpcd"
+                    sleep 15
+                fi
 
                 # Check connection again after restart attempt
                 check_connection
@@ -753,12 +710,7 @@ while true; do
                 seconds=$((time_diff % 60))
                 downtime_str="${minutes}m ${seconds}s"
 
-                timeout_message="[CRITICAL] Pi-hole recovery failed!
-- Down since: $saved_down_time  # FIXED: Use saved_down_time
-- Current time: $timeout_time
-- Total downtime: $downtime_str
-- All $MAX_RETRIES attempts failed
-Manual intervention required!"
+                timeout_message="[CRITICAL] Pi-hole still down since $saved_down_time. Total: ${downtime_str}. ${MAX_RETRIES} attempts failed."
 
                 log_message "Failed to restore connection after $MAX_RETRIES attempts"
                 log_message "Total downtime so far: $downtime_str"

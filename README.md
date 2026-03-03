@@ -26,7 +26,9 @@ A robust Bash script that monitors network connectivity on a Pi-hole device, aut
 
 <pre><code>
 # 1. Install dependencies
-sudo apt update && sudo apt install -y postfix mailutils libc-bin ethtool
+sudo apt update && sudo apt install -y postfix mailutils libc-bin ethtool wpasupplicant iw
+
+# 👉 The script must run as root (no sudo inside — systemd handles this via User=root)
 
 # 👉 If using Gmail as your mail relay, you'll also need to:
 #    - Create an App Password: https://myaccount.google.com/apppasswords
@@ -75,6 +77,9 @@ sudo systemctl status reconnect_router.service
 <summary><strong>Click to expand feature list</strong></summary>
 
 * **Automatic reconnection** — Detects connectivity loss and reattempts connection with intelligent retries
+* **Graduated recovery ladder** — Escalates from soft `wpa_cli reconnect` → link bounce → `dhcpcd` restart
+* **Internet-first connectivity check** — Tests upstream IPs (Cloudflare) before the router, so router ICMP blips don't trigger a restart
+* **Failure threshold debounce** — Requires sustained failure for ~60 seconds before any recovery action
 * **Exponential backoff** — Gradually increases delay during outages, capped at 10 minutes
 * **SMS notifications** — Real-time alerts with queued delivery and message type prioritization
 * **Heartbeat monitoring** — Tracks unexpected interruptions and logs downtime duration
@@ -87,10 +92,10 @@ sudo systemctl status reconnect_router.service
 * **Log rotation** — Prevents disk bloat with built-in size checks and auto-rotation
 * **Anti-spam safeguards** — Suppresses duplicate START messages within configurable intervals
 * **Concise SMS format** — Includes downtime and retry count while staying under SMS length limits
-* **Resilience improvements** — Fully quoted variables, consistent error handling, graceful shutdown
+* **Wi-Fi power save management** — Disables `brcmfmac` power save after each link-up to reduce spurious ping drops
 * **Dual network issue detection** — Differentiates router drop vs internet-only failures
-* **DHCP client detection** — Supports both `dhclient` and `dhcpcd` systems automatically
-* **Redundant DNS checks** — Uses multiple servers (Cloudflare, Google) to verify internet access
+* **dhcpcd integration** — Link bounce only; lets `dhcpcd` handle DHCP automatically without conflicts
+* **Redundant DNS checks** — Uses multiple upstream IPs (Cloudflare) to verify internet access
 </details>
 
 ## Prerequisites
@@ -111,7 +116,7 @@ The script requires the following dependencies:
 sudo apt update
 
 # Install postfix, mailutils and other dependencies
-sudo apt install postfix mailutils libc-bin
+sudo apt install postfix mailutils libc-bin wpasupplicant iw
 ```
 > **Note:** `iconv` is included in `libc-bin`, so installing `libc-bin` will provide `iconv`.
 </details>
@@ -165,7 +170,7 @@ User=root
 WantedBy=multi-user.target
 ```
 
-> **Note:** The service uses `Restart=always` with `RestartSec=30` to prevent excessive restart cycles.
+> **Note:** The service must run as `root` — the script uses `ip`, `iw`, `ethtool`, and `systemctl` directly without `sudo`. Running it as any other user will fail. The `Restart=always` + `RestartSec=30` pairing prevents excessive restart cycles.
 
 Enable and start the service:
 
@@ -205,6 +210,7 @@ sudo systemctl start reconnect_router.service
 <summary><strong>Optional Parameters</strong></summary>
 
 - `RETRY_DELAY`: Time between reconnection attempts (default: 15s)
+- `ROUTER_FAILURE_THRESHOLD`: Consecutive failures required before triggering recovery (default: 4, ~60s at 15s delay)
 - `MAX_RETRIES`: Maximum reconnection attempts before giving up (default: 10)
 - `HEARTBEAT_ENABLED`: Enable/disable heartbeat monitoring (default: true)
 - `HEARTBEAT_INTERVAL`: Time between heartbeat checks (default: 3600s = 1 hour)
@@ -286,9 +292,11 @@ Example recovery message:
 <details>
 <summary><strong>Internet Connectivity Handling</strong></summary>
 
-The script distinguishes between two types of connectivity issues:
-1. **Complete connection loss** — Cannot reach the router
-2. **Internet-only failures** — Can reach the router but not the internet
+The script checks upstream internet connectivity **first** on every cycle. If `1.1.1.1` or `1.0.0.1` responds, the connection is considered healthy regardless of whether the router answers ICMP — this prevents router ping blips from triggering unnecessary restarts.
+
+If the upstream check fails, the script checks the router to distinguish between two failure types:
+1. **Complete connection loss** — Cannot reach the router (Wi-Fi likely down; triggers graduated recovery)
+2. **Internet-only failures** — Can reach the router but not the internet (ISP issue; no Wi-Fi restart)
 
 For internet-only failures, the script uses a more gradual approach:
 ```bash
@@ -480,7 +488,7 @@ The script sends different types of alerts:
 - **[ALERT]** - Network connection lost
 - **[TRYING]** - Reconnection attempts (limited to every 3rd attempt to reduce spam)
 - **[OK]** - Connection successfully restored (with concise downtime info and attempt count)
-- **[CRITICAL]** - All reconnection attempts failed
+- **[CRITICAL]** - All reconnection attempts failed (single-line, SMS-safe format)
 </details>
 
 ## Troubleshooting
@@ -523,9 +531,9 @@ If you're receiving unexpected `[START]` notifications:
 
 - Confirm the correct network interface name with: `ip a`
 - Verify the router IP is correct: `ping 192.168.1.1` (replace with your router's IP)
-- Check the DHCP client is working: `ps aux | grep dhclient` or `ps aux | grep dhcpcd`
-- Review verbose dhclient output in the logs
-- Verify both dhclient and dhcpcd availability on your system
+- Confirm `dhcpcd` is managing the interface: `ps aux | grep dhcpcd`
+- Check that `wpa_cli` is available: `which wpa_cli` (required for level-1 soft recovery)
+- Do **not** run `dhclient` alongside `dhcpcd` — they will fight over routes and IP assignment
 </details>
 
 <details>
