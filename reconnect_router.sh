@@ -1,5 +1,7 @@
 #!/bin/bash
-set -Eeuo pipefail  # -e: exit on error, -E: inherit ERR traps, -u: error on unset vars, -o pipefail: catch pipe failures
+set -Euo pipefail  # -E: inherit ERR traps, -u: error on unset vars, -o pipefail: catch pipe failures
+# Intentionally omitting -e: this is a long-running daemon where many commands
+# legitimately return nonzero (grep, ping, arithmetic). Use explicit || guards instead.
 
 # Force UTF-8
 export LANG=en_US.UTF-8
@@ -24,8 +26,6 @@ INTERNET_WAS_DOWN=false
 ROUTER_WAS_DOWN=false
 LAST_INTERNET_DOWN_TIME=""
 LAST_ROUTER_DOWN_TIME=""
-SMS_INTERNET_FAILURE_THRESHOLD=10  # Number of consecutive internet failures before SMS alert (10 ~ 3Min; 20 ~ 9min)
-
 # Added flag to prevent duplicate restoration logs
 DOWNTIME_ALREADY_LOGGED=false
 
@@ -44,8 +44,12 @@ HEARTBEAT_FILE="/tmp/pihole_last_heartbeat"
 HEARTBEAT_LOG="/var/log/router_heartbeat.log" # New: dedicated log for heartbeat events
 
 # Internet failure tracking
+# One threshold: send SMS after this many consecutive internet-only failures.
+# At RETRY_DELAY=15s per loop, 10 failures ≈ 2.5 minutes of no internet.
+# The old MAX_INTERNET_FAILURES=5 that reset the counter is removed — it
+# prevented SMS_INTERNET_FAILURE_THRESHOLD from ever being reached.
 INTERNET_FAILURES=0
-MAX_INTERNET_FAILURES=5
+SMS_INTERNET_FAILURE_THRESHOLD=10
 
 # Lock file
 LOCK_FILE="/tmp/reconnect_router.lock"
@@ -72,27 +76,31 @@ else
     log_message "Last terminated reason: Not available"
 fi
 
-# Check for startup frequency - NEW
-STARTUP_CHECK_FILE="/tmp/reconnect_router_last_start"
-STARTUP_THRESHOLD=300  # 5 minutes
+# Determine if this is a true reboot or just a failure-restart by comparing boot IDs.
+# Boot ID lives in /proc (changes on every real reboot) and we persist the last-seen
+# value in /var/lib so it survives systemd-tmpfiles wiping /tmp at 4am.
+BOOT_ID_FILE="/var/lib/reconnect_router_last_boot_id"
+CURRENT_BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "unknown")
 
-if [ -f "$STARTUP_CHECK_FILE" ]; then
-    last_start=$(cat "$STARTUP_CHECK_FILE" 2>/dev/null || echo "0")
-    current_time=$(date +%s)
-    elapsed=$((current_time - last_start))
-    
-    if [ $elapsed -lt $STARTUP_THRESHOLD ]; then
-        log_message "Script restarted within $elapsed seconds - suppressing start notification"
+if [ -f "$BOOT_ID_FILE" ]; then
+    last_boot_id=$(cat "$BOOT_ID_FILE" 2>/dev/null || echo "")
+    if [ "$last_boot_id" = "$CURRENT_BOOT_ID" ]; then
+        # Same boot, script was restarted by systemd after a failure — suppress SMS
+        log_message "Script restarted within same boot session (boot ID unchanged) - suppressing start notification"
         SUPPRESS_START_NOTIFICATION=true
     else
+        # Boot ID changed — genuine reboot, send SMS
+        log_message "New boot detected (boot ID changed) - will send start notification"
         SUPPRESS_START_NOTIFICATION=false
     fi
 else
+    # First run ever — no stored boot ID
     SUPPRESS_START_NOTIFICATION=false
 fi
 
-# Update startup time
-date +%s > "$STARTUP_CHECK_FILE"
+# Persist current boot ID for next startup
+echo "$CURRENT_BOOT_ID" > "$BOOT_ID_FILE" 2>/dev/null || \
+    log_message "WARNING: Could not write boot ID to $BOOT_ID_FILE — check /var/lib permissions"
 
 # Check for required dependencies
 for cmd in mail iconv ip ping flock wpa_cli iw; do
@@ -450,17 +458,13 @@ check_connection() {
         fi
 
         log_message "Can reach router but cannot reach internet (none of: ${DNS_CHECK_HOSTS[*]} responded)"
-        ((INTERNET_FAILURES++))
+        INTERNET_FAILURES=$((INTERNET_FAILURES + 1))
 
-        if [ "$INTERNET_FAILURES" -ge "$MAX_INTERNET_FAILURES" ]; then
-            log_message "Internet unreachable for $MAX_INTERNET_FAILURES attempts — backing off temporarily"
-
-            if [ "$INTERNET_FAILURES" -ge "$SMS_INTERNET_FAILURE_THRESHOLD" ]; then
-                send_sms "[ALERT] Pi-hole has no internet despite router access. $INTERNET_FAILURES consecutive failures."
-            fi
-
-            sleep $((RETRY_DELAY * 5))
-            INTERNET_FAILURES=0
+        # Send one SMS alert when the threshold is first crossed; keep counting so
+        # the recovery log reflects the true failure count. Counter resets in the
+        # return-0 branch above when internet comes back.
+        if [ "$INTERNET_FAILURES" -eq "$SMS_INTERNET_FAILURE_THRESHOLD" ]; then
+            send_sms "[ALERT] Pi-hole has no internet despite router access. ${INTERNET_FAILURES} consecutive failures (~$((INTERNET_FAILURES * RETRY_DELAY / 60))min)."
         fi
 
         return 2
@@ -557,7 +561,10 @@ self_test() {
     return 0
 }
 
-# Trap script termination - ENHANCED CLEANUP
+# Cleanup runs once, always through the EXIT trap.
+# Signal traps just call exit with the correct code, which fires EXIT.
+# This prevents double-cleanup (the old pattern ran cleanup in the signal trap
+# and then again via EXIT, causing duplicate log lines and flock errors).
 cleanup() {
     log_message "Script stopped. Ensuring interface is up..."
     log_heartbeat "STOPPED" "Script terminated"
@@ -565,14 +572,24 @@ cleanup() {
 
     # Clean up temp files
     rm -f /tmp/sms_queue.txt || true
-    
+
     # Release lock first, then remove the file
     flock -u 200 || true
     exec 200>&- || true
     rm -f "$LOCK_FILE" || true
 }
-trap 'EXIT_CODE=$?; echo "$(date) - Script stopped. Exit code: $EXIT_CODE" > /tmp/reconnect_router_debug; echo "$(date +"%Y-%m-%d %H:%M:%S") - Normal termination" > /tmp/reconnect_router_clean_exit; cleanup; exit $EXIT_CODE' EXIT
-trap cleanup SIGTERM SIGINT SIGHUP
+
+on_exit() {
+    local ec=$?
+    echo "$(date) - Script stopped. Exit code: $ec" > /tmp/reconnect_router_debug
+    cleanup
+    exit "$ec"
+}
+
+trap on_exit EXIT
+trap 'exit 143' SIGTERM   # 128 + 15
+trap 'exit 130' SIGINT    # 128 + 2
+trap 'exit 129' SIGHUP    # 128 + 1
 
 # Run self-test
 self_test || log_message "WARNING: Self-test reported issues, but continuing execution"
@@ -722,34 +739,12 @@ while true; do
             fi
         fi
     elif [ $connection_code -eq 2 ]; then  # Can reach router but not internet
-        # Increment failure count but with a lower weight
-        consecutive_failures=$((consecutive_failures + 1))
-        
-        # For internet-only failures, we don't need to do a full network restart
-        # Just log and wait - no exit needed
-        log_message "Can reach router but not internet. Attempt $consecutive_failures - waiting to retry"
-        
-        # If this persists for multiple cycles, try a network restart
-        if [ $consecutive_failures -gt 5 ] && [ $((consecutive_failures % 5)) -eq 0 ]; then
-            log_message "Persistent internet connectivity issues - attempting network restart"
-
-            restart_ok=true
-
-            if [ -f "$RESTART_TIME_FILE" ]; then
-                last_restart=$(cat "$RESTART_TIME_FILE" 2>/dev/null || echo "0")
-                now=$(date +%s)
-                if (( now - last_restart < RESTART_INTERVAL )); then
-                    log_message "... suppressed ..."
-                    restart_ok=false
-                    sleep $RETRY_DELAY
-                fi
-            fi
-
-            if $restart_ok; then
-                date +%s > "$RESTART_TIME_FILE"
-                restart_interface
-            fi
-        fi
+        # Internet-only failure: router is reachable so Wi-Fi is fine.
+        # Bouncing the interface can't fix an ISP or upstream issue.
+        # Just log and let check_connection() handle SMS after SMS_INTERNET_FAILURE_THRESHOLD.
+        # consecutive_failures is intentionally NOT incremented here — that counter is for
+        # router-level failures that warrant reconnection attempts.
+        log_message "Can reach router but not internet — waiting for upstream to recover"
     else
         consecutive_failures=0
     fi

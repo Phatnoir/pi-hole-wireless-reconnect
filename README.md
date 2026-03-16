@@ -90,7 +90,7 @@ sudo systemctl status reconnect_router.service
 * **Self-test** — Validates network interface, DHCP client, and dependencies on launch
 * **Error handling** — Trap-based termination with environment cleanup
 * **Log rotation** — Prevents disk bloat with built-in size checks and auto-rotation
-* **Anti-spam safeguards** — Suppresses duplicate START messages within configurable intervals
+* **Anti-spam safeguards** — Suppresses duplicate START messages on same-boot restarts using kernel boot ID; only alerts on true reboots
 * **Concise SMS format** — Includes downtime and retry count while staying under SMS length limits
 * **Wi-Fi power save management** — Disables `brcmfmac` power save after each link-up to reduce spurious ping drops
 * **Dual network issue detection** — Differentiates router drop vs internet-only failures
@@ -218,12 +218,10 @@ sudo systemctl start reconnect_router.service
 - `PING_COUNT`: Number of pings to send when checking connection (default: 2)
 - `PING_TIMEOUT`: Timeout in seconds for ping operation (default: 3)
 - `PING_SIZE`: Size of ping packet in bytes (default: 32)
-- `MAX_INTERNET_FAILURES`: Number of internet failures before temporary backoff (default: 5)
-- `STARTUP_THRESHOLD`: Time (in seconds) to suppress duplicate startup notifications (default: 300)
-- `RESTART_INTERVAL`: Minimum time between interface restarts (default: 180s = 3 minutes)
+
 - `DNS_CHECK_HOSTS`: Array of DNS servers to check for internet connectivity (default: Cloudflare DNS)
 - `SMS_INTERNET_CHECK`: IP address to verify internet connectivity for SMS delivery (default: 8.8.8.8)
-- `SMS_INTERNET_FAILURE_THRESHOLD`: Minimum number of consecutive internet-only failures before sending an [OK] recovery SMS (default: 10)
+- `SMS_INTERNET_FAILURE_THRESHOLD`: Consecutive internet-only failures before sending an [ALERT] SMS (default: 10, ≈2.5 min at 15s retry delay)
 </details>
 
 ### Advanced Configuration
@@ -231,15 +229,14 @@ sudo systemctl start reconnect_router.service
 <details>
 <summary><strong>Startup Notification Management</strong></summary>
 
-The script includes a feature to prevent duplicate startup notifications when the service restarts frequently:
+The script suppresses duplicate startup SMS notifications by comparing the kernel boot ID on each start:
 
 ```bash
-# Startup notification configuration
-STARTUP_CHECK_FILE="/tmp/reconnect_router_last_start"
-STARTUP_THRESHOLD=300  # 5 minutes
+BOOT_ID_FILE="/var/lib/reconnect_router_last_boot_id"
+CURRENT_BOOT_ID=$(cat /proc/sys/kernel/random/boot_id)
 ```
 
-If the script restarts within 5 minutes of a previous run, it will suppress the startup SMS notification to reduce message spam. You can adjust the threshold by changing the value (in seconds).
+The boot ID is stored in `/var/lib/` (survives `/tmp` wipes) and changes only on a real reboot. If the stored ID matches the current one, the script was restarted by systemd after a failure and suppresses the SMS. If the IDs differ, the Pi-hole genuinely rebooted and the SMS fires. This correctly handles scheduled reboots (e.g. a 4am weekly reboot via cron) without requiring any time-window tuning.
 </details>
 
 <details>
@@ -296,29 +293,16 @@ The script checks upstream internet connectivity **first** on every cycle. If `1
 
 If the upstream check fails, the script checks the router to distinguish between two failure types:
 1. **Complete connection loss** — Cannot reach the router (Wi-Fi likely down; triggers graduated recovery)
-2. **Internet-only failures** — Can reach the router but not the internet (ISP issue; no Wi-Fi restart)
+2. **Internet-only failures** — Can reach the router but not the internet (ISP issue; script logs and waits)
 
-For internet-only failures, the script uses a more gradual approach:
+For internet-only failures the script deliberately does **not** bounce `wlan0` — if the router is reachable, the Wi-Fi link is fine and a restart can't fix an upstream ISP issue. Instead, the failure counter increments each cycle and a single [ALERT] SMS fires when the threshold is crossed:
+
 ```bash
-# Internet failure tracking settings
 INTERNET_FAILURES=0
-MAX_INTERNET_FAILURES=5
+SMS_INTERNET_FAILURE_THRESHOLD=10  # ≈2.5 min at default 15s retry delay
 ```
 
-When internet-only failures persist for multiple cycles, the script will attempt a network restart after reaching the threshold, but with less aggressive timing than for complete connection loss. The script also enforces a minimum interval between interface restarts via:
-
-```bash
-RESTART_TIME_FILE="/tmp/reconnect_last_iface_restart"
-RESTART_INTERVAL=180  # 3 minutes minimum between restarts
-```
-
-Additionally, to avoid noise from short-term internet drops, recovery SMS messages are only sent after a configurable threshold:
-
-```bash
-# Alert threshold for internet-only recoveries
-SMS_INTERNET_FAILURE_THRESHOLD=10
-```
-This ensures that recovery alerts (e.g., [OK]) are only sent after prolonged internet failures.
+The counter resets automatically when internet connectivity is restored.
 </details>
 
 <details>
@@ -484,7 +468,7 @@ sudo logrotate -f /etc/logrotate.d/reconnect_router
 
 The script sends different types of alerts:
 
-- **[START]** - Script has started (suppressed if restarted within 5 minutes)
+- **[START]** - Script has started after a true system reboot (suppressed on same-boot failure-restarts)
 - **[ALERT]** - Network connection lost
 - **[TRYING]** - Reconnection attempts (limited to every 3rd attempt to reduce spam)
 - **[OK]** - Connection successfully restored (with concise downtime info and attempt count)
@@ -506,10 +490,10 @@ The script sends different types of alerts:
 <summary><strong>Multiple start notifications</strong></summary>
 
 If you're receiving unexpected `[START]` notifications:
-* Confirm that your service is correctly using `Restart=always` — this is expected for continuous monitoring.
-* Check if `STARTUP_THRESHOLD` (default: 300 seconds) is set appropriately for your environment's restart frequency.
-* Review logs (`journalctl -u reconnect_router.service`) for crash loops or permission issues causing frequent service restarts.
-* If the script is restarting extremely often (multiple times per minute), this indicates a deeper problem and you should check for errors in the script's execution.
+* The script uses the kernel boot ID to distinguish a true reboot from a systemd failure-restart. A `[START]` SMS should only fire when the boot ID changes (i.e. the Pi-hole actually rebooted).
+* If you're getting `[START]` texts on failure-restarts, check that `/var/lib/reconnect_router_last_boot_id` exists and is readable by root.
+* Review logs (`journalctl -u reconnect_router.service`) for crash loops or permission issues causing frequent restarts.
+* If the script is restarting extremely often (multiple times per minute), this indicates a deeper problem — check for unguarded nonzero exits or dependency failures in the log.
 </details>
 
 <details>
@@ -553,11 +537,11 @@ The script logs its termination reasons:
 # View the last termination reason
 cat /tmp/reconnect_router_last_term.log
 
-# Check clean exit markers
-cat /tmp/reconnect_router_clean_exit
-
 # View systemd termination information
 sudo journalctl -u reconnect_router.service | grep -i "terminated"
+
+# Check exit code from last run
+cat /tmp/reconnect_router_debug
 ```
 
 These logs can help diagnose why the script might be restarting unexpectedly.
@@ -570,7 +554,7 @@ If you're experiencing situations where the router is reachable but the internet
 
 1. Check the main log for "Can reach router but cannot reach internet" messages
 2. Verify the DNS check hosts are reachable from your network: `ping 1.1.1.1` and `ping 1.0.0.1`
-3. Consider adjusting the `MAX_INTERNET_FAILURES` value (default: 5) if you have an inconsistent internet connection
+3. Consider adjusting `SMS_INTERNET_FAILURE_THRESHOLD` (default: 10, ≈2.5 min) if you want earlier or later SMS alerts for persistent internet-only outages
 4. Review the `RETRY_DELAY` value which affects how quickly the script responds to transient issues
 </details>
 
@@ -593,7 +577,8 @@ sudo rm -f /usr/local/bin/reconnect_router.sh
 echo "Removing logs..."
 sudo rm -f /var/log/reconnect_router.log /var/log/router_downtime.log /var/log/router_heartbeat.log
 echo "Removing temporary files..."
-sudo rm -f /tmp/reconnect_router.lock /tmp/sms_queue.txt /tmp/pihole_last_heartbeat /tmp/reconnect_router_last_start /tmp/reconnect_router_last_term.log /tmp/reconnect_router_clean_exit
+sudo rm -f /tmp/reconnect_router.lock /tmp/sms_queue.txt /tmp/pihole_last_heartbeat /tmp/reconnect_router_last_term.log
+sudo rm -f /var/lib/reconnect_router_last_boot_id
 echo "Reloading systemd..."
 sudo systemctl daemon-reload
 echo "Uninstallation complete."
